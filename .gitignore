@@ -1,0 +1,16 @@
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# WorkBuddy 本地工作区数据（不纳入版本库）
+.workbuddy/
+
+# 临时文件
+*.tmp
+*.log

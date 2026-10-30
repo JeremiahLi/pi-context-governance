@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>pi 上下文治理插件 · 总体设计说明</title>
+<style>
+body{font-family:-apple-system,"Segoe UI","Noto Sans SC","Microsoft YaHei",sans-serif;background:#fff;color:#2C2C2A;margin:0;padding:56px 24px 80px;line-height:1.8;-webkit-font-smoothing:antialiased}
+.wrap{max-width:940px;margin:0 auto}
+h1{font-size:27px;font-weight:600;margin:0 0 10px;letter-spacing:-.3px}
+.sub{color:#6B6A64;font-size:14px;margin:0 0 12px}
+.meta{color:#8A8880;font-size:12.5px;padding-bottom:28px;border-bottom:1px solid #E8E6DE}
+h2{font-size:19px;font-weight:600;margin:52px 0 18px;padding-bottom:9px;border-bottom:1px solid #E8E6DE}
+h3{font-size:15px;font-weight:600;margin:28px 0 10px}
+p,li{font-size:14.5px;color:#3A3A38;margin:10px 0}
+ul,ol{padding-left:22px}
+table{border-collapse:collapse;width:100%;margin:18px 0;font-size:13.5px}
+th,td{border:1px solid #E8E6DE;padding:9px 13px;text-align:left;vertical-align:top}
+th{background:#F7F5EF;font-weight:600}
+code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-family:ui-monospace,Consolas,monospace}
+.fig{margin:26px 0;padding:18px 18px 10px;background:#FCFBF7;border:1px solid #EEECE4;border-radius:10px}
+.cap{font-size:12.5px;color:#75736C;margin:6px 0 8px;text-align:center}
+.key{border-left:3px solid #0F6E56;background:#E1F5EE;padding:13px 18px;margin:20px 0;border-radius:0 8px 8px 0;font-size:14px}
+.warn{border-left:3px solid #BA7517;background:#FAEEDA;padding:13px 18px;margin:20px 0;border-radius:0 8px 8px 0;font-size:14px}
+.bad{border-left:3px solid #A32D2D;background:#FCEBEB;padding:13px 18px;margin:20px 0;border-radius:0 8px 8px 0;font-size:14px}
+.toc{background:#FCFBF7;border:1px solid #EEECE4;border-radius:10px;padding:16px 22px;font-size:13.5px;margin:28px 0}
+.toc a{color:#185FA5;text-decoration:none}
+.toc a:hover{text-decoration:underline}
+.toc div{margin:5px 0}
+.tag{display:inline-block;font-size:11.5px;padding:1px 8px;border-radius:10px;background:#F1EFE8;color:#5F5E5A;margin-right:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>pi 上下文治理插件 · 总体设计说明</h1>
+<p class="sub">阶段 0–4 全景：框架、原理、能力边界与取舍</p>
+<p class="meta">v1.0 · 2026-10-30 · 配套文档：<code>phase-0</code> ~ <code>phase-3</code>、<code>lag1-masking-design</code>、<code>pi-context-compression-prd-v0.1</code></p>
+
+<div class="toc">
+<div><a href="#s0">0 · 一页速览</a></div>
+<div><a href="#s1">1 · 为什么做，以及不做什么</a></div>
+<div><a href="#s2">2 · 全景架构：一条上下文进入模型前的四道工序</a></div>
+<div><a href="#s3">3 · 阶段 0 · 度量与归因</a></div>
+<div><a href="#s4">4 · 阶段 1 · 读取纪律</a></div>
+<div><a href="#s5">5 · 阶段 2 · 削减与移出（2A / 2B / 2C）</a></div>
+<div><a href="#s6">6 · 阶段 3 · 状态外部化</a></div>
+<div><a href="#s7">7 · 阶段 4 · 子 agent 隔离</a></div>
+<div><a href="#s8">8 · 实施路线与决策点</a></div>
+<div><a href="#s9">9 · 收益构成与代价</a></div>
+<div><a href="#s10">10 · 能力边界、风险与术语</a></div>
+</div>
+
+<h2 id="s0">0 · 一页速览</h2>
+
+<p>一句话：<strong>这套插件不压缩历史，它管理"什么进上下文、什么时候移出、什么写成文件"。</strong></p>
+
+<p>上下文的一生有四个可以动手的位置，加上两个旁路机制，就是这个插件的全部：</p>
+
+<p><strong>不产生 → 少进来 → 削一刀 → 移出去 → 记下来（+ 隔离）</strong></p>
+
+<table>
+<tr><th style="width:92px">阶段</th><th style="width:150px">一句话</th><th style="width:104px">作用位置</th><th>主要产出</th><th style="width:74px">状态</th></tr>
+<tr><td><b>0 度量</b></td><td>先知道 token 花在哪</td><td>观测（旁路）</td><td>token 归因报告、遮蔽收益模拟、判定结论</td><td>前置，必做</td></tr>
+<tr><td><b>1 读取纪律</b></td><td>用工具契约决定"拿多少"</td><td>请求发生前</td><td>read / grep / bash / ls 的契约与阈值</td><td>必做</td></tr>
+<tr><td><b>2A 入口削减</b></td><td>进来的东西先削一遍</td><td>写入上下文前</td><td>8 条确定性清洗规则 + 中部扫描 + 落盘</td><td>必做</td></tr>
+<tr><td><b>2B 出口移出</b></td><td>看过之后把历史移出去</td><td>下一轮组装时</td><td>lag-1 遮蔽、偏移索引、recall</td><td><b>条件性</b></td></tr>
+<tr><td><b>2C 非工具内容</b></td><td>thinking 与重复文本</td><td>低频（compaction 时刻）</td><td>provider 能力表、清理策略</td><td>可选</td></tr>
+<tr><td><b>3 状态外部化</b></td><td>该记的记到文件</td><td>旁路（尾部注入）</td><td><code>.pi/state/</code>：计划 / 事实 / 判断 / 约束 / 交接</td><td>长期价值最高</td></tr>
+<tr><td><b>4 子 agent</b></td><td>不该主线程看的别拿进来</td><td>上下文边界</td><td>契约化返回（结论 + 证据指针）</td><td>最后做</td></tr>
+</table>
+
+<div class="key">
+<strong>三条贯穿全局的判断：</strong><br>
+① 压缩作为<em>质量手段</em>被高估（模型升级会带走它的价值），作为<em>成本手段</em>成立但排在最后。<br>
+② 上下文的可靠性不能靠"记得"，只能靠"写下来 + 能校验"。<br>
+③ 便宜的机制先做：不产生 &gt; 少进来 &gt; 削一刀 &gt; 移出去。
+</div>
+
+<h2 id="s1">1 · 为什么做，以及不做什么</h2>
+
+<h3>1.1 起点</h3>
+<p>基于 pi 的 agent 跑到长会话时，token 成本与响应延迟失控；同时观察到明显的"记忆变形"：越到后面越容易重复踩坑、忘掉用户中途说过的约束、把早期错误判断当成既定事实。</p>
+
+<p>直觉的解法是"压缩历史"。但这条路有三个结构性问题：</p>
+
+<table>
+<tr><th style="width:150px">问题</th><th>说明</th></tr>
+<tr><td><strong>字面量先死</strong></td><td>摘要保住"意思"，杀掉"具体"——确切的报错文本、行号、API 签名。而 40 步之后需要恰恰是具体</td></tr>
+<tr><td><strong>只有放大误差的通路</strong></td><td>每步结论 → 计划进度 → 会话摘要，层层继承。一个早期误判到最上层就变成"我们当初的决定"，没有任何环节会回头质疑</td></tr>
+<tr><td><strong>价值随模型升级归零</strong></td><td>摘要压缩的本质是"弥补模型读不了太长"。模型变强，这个补丁就贬值，而维护成本不变</td></tr>
+</table>
+
+<h3>1.2 因此的转向</h3>
+<p>不做"把历史压短"，改成三件互相独立的事：<strong>控制入口的粒度</strong>（阶段 1、2A）、<strong>控制历史的留存方式</strong>（2B，可选）、<strong>把状态从对话里搬到可校验的文件</strong>（阶段 3）。</p>
+
+<p>这三件事的共同点是：它们不与模型能力竞争，而是与账单和可靠性竞争。</p>
+
+<h3>1.3 明确不做</h3>
+<table>
+<tr><th style="width:210px">不做</th><th>原因</th></tr>
+<tr><td>LLM 摘要式压缩历史</td><td>前三行的问题；pi 内置 compaction 留作最后兜底</td></tr>
+<tr><td>按重要性挑着削减/遮蔽</td><td>破坏前缀缓存的 FIFO 性质，代价高一个数量级（见 §5.3）</td></tr>
+<tr><td>二次合并（把多条记录合成一条）</td><td>合并发生在老位置，等于全量缓存失效；且破坏"一次冻结"</td></tr>
+<tr><td>跨会话的语义检索</td><td>另一个问题，需要另一套存储；混进来会让本插件失焦</td></tr>
+<tr><td>修改 pi 的 session JSONL</td><td>源真相只读。任何写入都会让审计与回放失效</td></tr>
+<tr><td>让模型自己维护状态</td><td>不确定、每轮花 token、会漂移。状态必须按来源分权（§6.2）</td></tr>
+</table>
+
+<h2 id="s2">2 · 全景架构</h2>
+
+<p>整个插件活在"消息组装"这一层：pi 从 session 树里取出可见消息之后、送给模型之前。所有机制都是这条链上的一个函数，全部可独立开关；全关时输出与原生逐字节一致。</p>
+
+<div class="fig">
+<svg viewBox="0 0 880 400" width="100%" role="img">
+<title>全景架构</title>
+<desc>上下文从请求、执行、削减、写入、观察、移出、回注的完整链路，度量旁路观测全部环节。</desc>
+<defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#8A8880" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g>
+<rect x="50" y="64" width="180" height="60" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width=".5"/>
+<text x="140" y="88" text-anchor="middle" font-size="13" font-weight="600" fill="#0C447C">① 阶段 1 · 请求</text>
+<text x="140" y="106" text-anchor="middle" font-size="11" fill="#185FA5">契约决定拿多少</text>
+</g>
+<line x1="232" y1="94" x2="266" y2="94" stroke="#8A8880" stroke-width="1.5" marker-end="url(#a)"/>
+<g>
+<rect x="270" y="64" width="180" height="60" rx="8" fill="#F1EFE8" stroke="#8A8880" stroke-width=".5"/>
+<text x="360" y="88" text-anchor="middle" font-size="13" font-weight="600" fill="#2C2C2A">② 工具执行</text>
+<text x="360" y="106" text-anchor="middle" font-size="11" fill="#5F5E5A">read · grep · bash</text>
+</g>
+<line x1="452" y1="94" x2="486" y2="94" stroke="#8A8880" stroke-width="1.5" marker-end="url(#a)"/>
+<g>
+<rect x="490" y="64" width="180" height="60" rx="8" fill="#FAEEDA" stroke="#BA7517" stroke-width=".5"/>
+<text x="580" y="88" text-anchor="middle" font-size="13" font-weight="600" fill="#854F0B">③ 阶段 2A · 削减</text>
+<text x="580" y="106" text-anchor="middle" font-size="11" fill="#BA7517">清噪 · 折叠 · 截断</text>
+</g>
+<line x1="672" y1="94" x2="706" y2="94" stroke="#8A8880" stroke-width="1.5" marker-end="url(#a)"/>
+<g>
+<rect x="710" y="64" width="120" height="60" rx="8" fill="#F1EFE8" stroke="#8A8880" stroke-width=".5"/>
+<text x="770" y="88" text-anchor="middle" font-size="12.5" font-weight="600" fill="#2C2C2A">④ 写入上下文</text>
+<text x="770" y="106" text-anchor="middle" font-size="11" fill="#993C1D">付费点</text>
+</g>
+
+<path d="M 770 126 L 770 170 L 240 170 L 240 196" fill="none" stroke="#8A8880" stroke-width="1.5" marker-end="url(#a)"/>
+
+<g>
+<rect x="150" y="200" width="180" height="60" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
+<text x="240" y="224" text-anchor="middle" font-size="13" font-weight="600" fill="#085041">⑤ 模型观察</text>
+<text x="240" y="242" text-anchor="middle" font-size="11" fill="#0F6E56">本轮完整可见</text>
+</g>
+<line x1="332" y1="230" x2="366" y2="230" stroke="#8A8880" stroke-width="1.5" marker-end="url(#a)"/>
+<g>
+<rect x="370" y="200" width="180" height="60" rx="8" fill="#FAEEDA" stroke="#BA7517" stroke-width=".5"/>
+<text x="460" y="224" text-anchor="middle" font-size="13" font-weight="600" fill="#854F0B">⑥ 阶段 2B · 移出</text>
+<text x="460" y="242" text-anchor="middle" font-size="11" fill="#BA7517">滞后一轮，只留记录</text>
+</g>
+<line x1="552" y1="230" x2="586" y2="230" stroke="#8A8880" stroke-width="1.5" marker-end="url(#a)"/>
+<g>
+<rect x="590" y="200" width="180" height="60" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
+<text x="680" y="224" text-anchor="middle" font-size="13" font-weight="600" fill="#085041">⑦ 阶段 3 · 回注</text>
+<text x="680" y="242" text-anchor="middle" font-size="11" fill="#0F6E56">尾部 500 token</text>
+</g>
+
+<rect x="50" y="302" width="780" height="50" rx="8" fill="none" stroke="#8A8880" stroke-width=".5" stroke-dasharray="5 4"/>
+<text x="440" y="323" text-anchor="middle" font-size="12.5" font-weight="600" fill="#5F5E5A">阶段 0 · 度量（旁路）</text>
+<text x="440" y="341" text-anchor="middle" font-size="11" fill="#8A8880">只观测，不改变任何一步；所有后续阶段的验收数字都出自这里</text>
+<text x="50" y="382" font-size="11.5" fill="#8A8880">阶段 4：把 ①–⑤ 整条链复制到一个独立上下文里跑，只回传契约化产物。</text>
+</svg>
+<p class="cap">图 1 · 一条上下文进入模型前的完整链路。四个实心阶段是主链，两个旁路是度量与隔离。</p>
+</div>
+
+<h3>2.1 四道工序的顺序不可调换</h3>
+
+<table>
+<tr><th style="width:120px">顺序</th><th>为什么必须是这个顺序</th></tr>
+<tr><td>pi compaction 先</td><td>压缩之后才知道哪些消息还在上下文里，后面的工序都在它的结果上工作</td></tr>
+<tr><td>2C → 2B</td><td>2C 会改写消息内容。先遮蔽再清理，两者会互相踩：被清理的那条可能正好是被遮蔽的那条</td></tr>
+<tr><td>2A 最后</td><td>2A 只作用于最新一条。它的结果会成为下一轮 2B 的处理对象（这也决定了二者的收益关系，见 §9）</td></tr>
+</table>
+
+<h3>2.2 一个不可违反的物理事实</h3>
+
+<p>所有"改写历史"的手段，代价都不取决于改了多少，而取决于<strong>改动点之后还有多少内容</strong>。因为 prompt cache 按前缀命中：改了第 k 条，失效的是第 k 条之后的全部。</p>
+
+<div class="fig">
+<svg viewBox="0 0 880 300" width="100%" role="img">
+<title>缓存失效范围</title>
+<desc>改尾部时失效范围只有一个片段，改中间时其后全部内容失效。</desc>
+<text x="40" y="46" font-size="13" font-weight="600" fill="#2C2C2A">只在尾部改（lag-1）：失效 ≈ 一个片段</text>
+<rect x="40" y="58" width="470" height="34" rx="6" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
+<text x="275" y="79" text-anchor="middle" font-size="12" fill="#085041">缓存命中（前缀不变，0.1×）</text>
+<rect x="516" y="58" width="150" height="34" rx="6" fill="#FAEEDA" stroke="#BA7517" stroke-width=".5"/>
+<text x="591" y="79" text-anchor="middle" font-size="12" fill="#854F0B">本条被改写</text>
+<rect x="672" y="58" width="168" height="34" rx="6" fill="#F1EFE8" stroke="#8A8880" stroke-width=".5"/>
+<text x="756" y="79" text-anchor="middle" font-size="12" fill="#5F5E5A">本轮新增</text>
+<line x1="516" y1="100" x2="664" y2="100" stroke="#BA7517" stroke-width=".5"/>
+<line x1="516" y1="96" x2="516" y2="104" stroke="#BA7517" stroke-width=".5"/>
+<line x1="664" y1="96" x2="664" y2="104" stroke="#BA7517" stroke-width=".5"/>
+<text x="590" y="116" text-anchor="middle" font-size="11" fill="#BA7517">代价 = 几 k token</text>
+
+<text x="40" y="164" font-size="13" font-weight="600" fill="#2C2C2A">改中间任何一条：失效 ≈ 整段</text>
+<rect x="40" y="176" width="250" height="34" rx="6" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
+<text x="165" y="197" text-anchor="middle" font-size="12" fill="#085041">缓存命中</text>
+<rect x="296" y="176" width="110" height="34" rx="6" fill="#FAEEDA" stroke="#BA7517" stroke-width=".5"/>
+<text x="351" y="197" text-anchor="middle" font-size="12" fill="#854F0B">被改写</text>
+<rect x="412" y="176" width="428" height="34" rx="6" fill="#FAEEDA" stroke="#BA7517" stroke-width=".5" stroke-dasharray="5 4"/>
+<text x="626" y="197" text-anchor="middle" font-size="12" fill="#854F0B">之后全部失效，整段重算</text>
+<line x1="296" y1="218" x2="838" y2="218" stroke="#BA7517" stroke-width=".5"/>
+<line x1="296" y1="214" x2="296" y2="222" stroke="#BA7517" stroke-width=".5"/>
+<line x1="838" y1="214" x2="838" y2="222" stroke="#BA7517" stroke-width=".5"/>
+<text x="567" y="234" text-anchor="middle" font-size="11" fill="#BA7517">代价 = 几乎全部上下文</text>
+
+<text x="40" y="272" font-size="12" fill="#5F5E5A">推论：改写只能从尾部严格 FIFO 推进；淘汰回退、跳选、二次合并，全部按右边那行计费。</text>
+</svg>
+<p class="cap">图 2 · 为什么"按重要性挑着压"在成本上不成立。</p>
+</div>
+
+<h2 id="s3">3 · 阶段 0 · 度量与归因</h2>
+
+<p><span class="tag">观测</span><span class="tag">1 天</span><span class="tag">离线 · 不调模型</span></p>
+
+<h3>3.1 解决什么</h3>
+<p>回答"token 到底花在哪"，以及"值不值得做后面四个阶段"。它不修改任何东西，只产出一份带结论的报告。</p>
+
+<h3>3.2 三个必须解决的坑</h3>
+
+<table>
+<tr><th style="width:150px">坑</th><th>处理方式</th></tr>
+<tr><td><strong>双口径</strong></td><td>路径上出现 compaction 时，之前的历史不再进上下文但仍在文件里。必须同时统计 <code>raw</code>（全部）与 <code>effective</code>（实际送模型），否则增长斜率必错</td></tr>
+<tr><td><strong>固定开销单列</strong></td><td>工具定义、skills、AGENTS.md 注入、系统提示，常占 10–25%。不单列就会把"工具定义 12k"误判成"工具输出是大头"，然后做一个完全错方向的优化</td></tr>
+<tr><td><strong>估算要校准</strong></td><td>多 provider 无统一 tokenizer。用分桶估算（CJK 1.6 字/token、其余 3.8 字符/token）再用 <code>usage</code> 最小二乘拟合，报告 MAPE。<b>MAPE &gt; 30% 时报告只许输出占比，不许输出金额</b></td></tr>
+</table>
+
+<h3>3.3 能力</h3>
+<ul>
+<li>五维归因：role / tool / path / turn / overhead，各出 top 10</li>
+<li>增长曲线与压缩事件的前后跳变，判断是否真的接近过窗口上限</li>
+<li><strong>缓存抖动检测</strong>：逐轮对前缀区算 hash，相邻不同即报警并输出首个差异行</li>
+<li><strong>遮蔽收益模拟</strong>：不写一行产品代码，先算出 2B 赚不赚，并输出 <code>S</code> 的分布</li>
+<li>重复错误检测：为阶段 4 的 A/B 预埋"是否重复踩同一个坑"的指标口径</li>
+</ul>
+
+<div class="warn">
+<strong>这个阶段最可能的发现，会让你跳过半个插件。</strong>如果 <code>prefix_instability &gt; 0</code> 且缓存命中率低，说明缓存是被自己废掉的（系统提示里的当前时间、每轮注入的 git status、插在历史前面的状态块）。修一行字符串就能拿回全部缓存收益——成本近零，收益可能超过所有削减机制的总和。
+</div>
+
+<h3>3.4 验收</h3>
+<p>≥3 个真实会话跑通；有 <code>usage</code> 的会话 MAPE ≤ 15%；报告必须能直接回答四个问题（工具占比、top5 消耗源、是否值得遮蔽、缓存是否在抖）；只读断言（输入文件 sha256 前后一致）；同一输入两次运行输出逐字节相同。</p>
+
+<h2 id="s4">4 · 阶段 1 · 读取纪律</h2>
+
+<p><span class="tag">请求前</span><span class="tag">4 个半天</span><span class="tag">无损</span><span class="tag">零维护</span></p>
+
+<h3>4.1 核心判断</h3>
+<p>单次输出过大的根因不是"工具返回太多"，而是<strong>工具允许无参数地返回全部</strong>。<code>read(path)</code> 不传 offset 就返回全文，等于把"读多少"的决策成本全推给模型——而模型看不到文件行数、也感知不到 token，它没法做一个它没有信息去做的决定。</p>
+
+<p>所以纪律必须在<strong>工具层</strong>，不是提示词层。提示词方案的三条死因：信息不对称（不知道文件多大）、注意力稀释（中段建议会被遗忘）、不可度量（违反了你也看不出来）。</p>
+
+<div class="fig">
+<svg viewBox="0 0 880 300" width="100%" role="img">
+<title>read 的三分支契约</title>
+<desc>无参数调用时按文件大小分三支，全局视图通过显式 full 参数保留。</desc>
+<defs><marker id="b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#8A8880" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="330" y="34" width="220" height="52" rx="8" fill="#F1EFE8" stroke="#8A8880" stroke-width=".5"/>
+<text x="440" y="65" text-anchor="middle" font-size="13" font-weight="600" fill="#2C2C2A">read(path) 无参数</text>
+<path d="M 440 88 L 440 116 L 160 116 L 160 140" fill="none" stroke="#8A8880" stroke-width="1.5" marker-end="url(#b)"/>
+<path d="M 440 88 L 440 140" fill="none" stroke="#8A8880" stroke-width="1.5" marker-end="url(#b)"/>
+<path d="M 440 88 L 440 116 L 720 116 L 720 140" fill="none" stroke="#8A8880" stroke-width="1.5" marker-end="url(#b)"/>
+
+<rect x="40" y="144" width="240" height="66" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
+<text x="160" y="168" text-anchor="middle" font-size="13" font-weight="600" fill="#085041">≤ 300 行</text>
+<text x="160" y="188" text-anchor="middle" font-size="11.5" fill="#0F6E56">直接返回全文</text>
+<text x="160" y="238" text-anchor="middle" font-size="11" fill="#75736C">看完即可 edit，零额外步数</text>
+
+<rect x="320" y="144" width="240" height="66" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
+<text x="440" y="168" text-anchor="middle" font-size="13" font-weight="600" fill="#085041">300 – 1500 行</text>
+<text x="440" y="188" text-anchor="middle" font-size="11.5" fill="#0F6E56">返回符号大纲 + 行号索引</text>
+<text x="440" y="238" text-anchor="middle" font-size="11" fill="#75736C">按大纲定位，再用 range 取块</text>
+
+<rect x="600" y="144" width="240" height="66" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5" stroke-dasharray="5 4"/>
+<text x="720" y="168" text-anchor="middle" font-size="13" font-weight="600" fill="#085041">&gt; 1500 行</text>
+<text x="720" y="188" text-anchor="middle" font-size="11.5" fill="#0F6E56">强制大纲，拒绝全文</text>
+<text x="720" y="238" text-anchor="middle" font-size="11" fill="#75736C">必须用 range 指定区间</text>
+
+<text x="40" y="282" font-size="12" fill="#5F5E5A">全局视图保留显式通道 full:true —— 砍掉它，重构类任务会退化成局部正确的错误修补。</text>
+</svg>
+<p class="cap">图 3 · read 的三分支。纪律不靠提示词，靠默认行为。</p>
+</div>
+
+<h3>4.2 能力</h3>
+<table>
+<tr><th style="width:110px">工具</th><th>契约要点</th></tr>
+<tr><td><code>read</code></td><td>三分支；行号前缀 <code>123| </code>（需明确声明不要复制进 edit 的 oldText）；同 path+sha+range 在 5 轮内重复则只回一句提示；生成文件/二进制/minified 直接拒读</td></tr>
+<tr><td><code>grep</code></td><td>默认返回聚合计数（每文件命中数），不返回行；展开时 <code>context=2</code>，命中文件数 &gt; 20 只回 top 20</td></tr>
+<tr><td><code>bash</code></td><td>软上限 200 行/8KB → head 80 + tail 40 + 落盘；硬上限 2000 行/200KB</td></tr>
+<tr><td><code>ls</code>/<code>glob</code></td><td>默认只列一层；条目 &gt; 50 折叠；始终忽略 <code>node_modules</code>/<code>dist</code> 等</td></tr>
+<tr><td><code>edit</code>/<code>write</code></td><td>只回 changed hunks 与统计，<strong>不自动回读</strong>（回读是最常见的双倍开支）</td></tr>
+</table>
+
+<h3>4.3 一个必须诚实对待的账</h3>
+<p>局部修改型任务会从"读全文 1 次"变成"读大纲 1 次 + 读区间 1 次"，<strong>步数 +1</strong>。在多轮循环里，多一次工具调用 = 多一次完整的上下文前缀读（100k 上下文约 10k token 当量）。</p>
+<p>所以这笔账是：省下约 10.9k 且此后每轮持续受益，一次性多付约 10k —— <strong>回本 1–2 轮</strong>。长会话大赚，≤3 轮的短任务小亏。所有"改写上下文形态"的手段都有这个性质，不是本阶段独有。</p>
+
+<h3>4.4 验收与主 SLI</h3>
+<p>主指标不是总 token，而是 <code>tokens_per_locate</code>（从首次工具调用到首次 edit 之间花的 token），目标下降 ≥50%，步数增幅 ≤5%。另有一条双向指标 <code>forced_full_read_rate</code>，目标区间 5%–20%：太低说明模型不敢看全局（会写出局部正确的错误修复），太高说明大纲质量不合格。</p>
+
+<h2 id="s5">5 · 阶段 2 · 削减与移出</h2>
+
+<p><span class="tag">2A 必做</span><span class="tag">2B 条件性</span><span class="tag">2C 可选</span></p>
+
+<h3>5.1 三块的分工</h3>
+<table>
+<tr><th style="width:110px">子块</th><th style="width:170px">作用域</th><th style="width:120px">时点</th><th>缓存代价</th></tr>
+<tr><td><b>2A 入口削减</b></td><td>最新一条工具结果</td><td>写入上下文前</td><td><strong>零</strong>（从未付过钱）</td></tr>
+<tr><td><b>2B 出口移出</b></td><td>历史工具结果</td><td>已观察之后的下一轮</td><td><code>1.15·S</code></td></tr>
+<tr><td><b>2C 非工具内容</b></td><td>thinking / 重复文本</td><td>低频（compaction 时刻）</td><td>一次性全量</td></tr>
+</table>
+
+<div class="key">
+<strong>2A 的安全边界：只能做确定性无损的削减。</strong>因为它发生在模型看到之前，赌错了模型连"被删了什么"都不知道。任何需要判断"这段重不重要"的操作都不属于 2A。2B 不同——模型已经看过原文，遮蔽是记忆整理，不是信息删减。这个区别决定了 2A 不能有损，2B 可以有损。
+</div>
+
+<h3>5.2 2A 的八条规则</h3>
+<p>ANSI 剥离、<code>\r</code> 覆写折叠、连续重复行折叠、空行压缩、行尾空白、超长单行截断、总量截断、非 UTF-8 容错。可逆性分三级：<strong>L0</strong> 纯表示层、<strong>L1</strong> 冗余消除、<strong>L2</strong> 有信息丢失。<strong>L2 必须先落盘成功，落盘失败则放弃变换、返回原文</strong>——宁可变大，不可丢数据。</p>
+
+<p>最关键的一条补充是<strong>中部扫描</strong>：head/tail 截断必然切掉中间，而报错常在中间。截断时对丢弃的中段做一次错误行正则扫描，命中的最多 20 行插回。不做它，你的截断会真的丢掉那行 <code>connection refused</code>，然后模型开始瞎猜。</p>
+
+<h3>5.3 2B 的全部难点在"位置"</h3>
+<p>机制本身很朴素：最新的工具输出永远完整，上一轮的输出在下一轮被替换成一条凝固的小记录。真正的设计约束来自图 2 那个物理事实。</p>
+
+<table>
+<tr><th style="width:150px">约束</th><th>内容</th></tr>
+<tr><td>一次冻结</td><td>同一位置只写一次，渲染必须确定性（无时间戳、无随机量、不用 LLM），否则每轮文本微变，缓存全废</td></tr>
+<tr><td>严格 FIFO</td><td>边界只前进。淘汰回退、按重要性跳选、"补一刀"，全部按整段计费</td></tr>
+<tr><td>结论先行</td><td>没有结论引用该证据时不得遮蔽，否则证据在使用之前就消失了</td></tr>
+<tr><td>移出 ≠ 删除</td><td>原文必须仍可取得（JSONL 偏移或 blob），召回只能追加在尾部、不能回填</td></tr>
+<tr><td>决策与渲染分离</td><td>哪些位置该遮由纯函数 <code>f(path, config)</code> 决定（天然支持分支与崩溃恢复），遮什么由一次性冻结决定（保证确定性与缓存友好）</td></tr>
+</table>
+
+<h3>5.4 时序：为什么是"滞后一轮"</h3>
+<p>因为它正好夹在"观察到"与"再次需要"之间，是这个间隔的最小值。代价公式为：</p>
+<p style="text-align:center;font-size:15px;margin:18px 0"><code>Δ = 1.15·S + 1.25·m − 0.1·M</code>　，<code>S</code> = 改动点之后的内容</p>
+<p>当 <code>S ≈ 2k</code>（一个回合）时，12k 的输出约 1 轮回本；当 <code>S ≈ 30k</code>（改了 20 轮前那条）时，代价高一个数量级。所以 lag-1 不是"稍微好一点"，它就是这个方案能成立的唯一原因。</p>
+
+<h3>5.5 收益上限（会改变实施顺序的结论）</h3>
+
+<div class="fig">
+<svg viewBox="0 0 880 290" width="100%" role="img">
+<title>2A 与 2B 的收益不叠加</title>
+<desc>同一份十二 k 输出，只做 2B 可压到一百六十，先做 2A 后停在两千，此时 2B 无事可做。</desc>
+<text x="40" y="46" font-size="12.5" fill="#5F5E5A">原始：单次 read 12k token</text>
+<rect x="40" y="54" width="640" height="32" rx="6" fill="#F1EFE8" stroke="#8A8880" stroke-width=".5"/>
+<text x="696" y="75" font-size="12" fill="#5F5E5A">12k</text>
+
+<text x="40" y="120" font-size="12.5" fill="#5F5E5A">过 2A：head / tail + 中部扫描</text>
+<rect x="40" y="128" width="107" height="32" rx="6" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
+<text x="163" y="149" font-size="12" fill="#0F6E56">2k</text>
+
+<text x="40" y="194" font-size="12.5" fill="#5F5E5A">再过 2B：已被 2A 削过，跳过</text>
+<rect x="40" y="202" width="107" height="32" rx="6" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5" stroke-dasharray="5 4"/>
+<text x="163" y="223" font-size="12" fill="#0F6E56">2k（不变）</text>
+
+<text x="40" y="266" font-size="12" fill="#5F5E5A">只做 2B 能到 160；先做 2A 就只能停在 2k，2B 付了缓存代价却无事可做。收益取上限，不相加。</text>
+</svg>
+<p class="cap">图 4 · 所以实施顺序是先 2A、量 p90，再决定 2B 要不要建。</p>
+</div>
+
+<div class="warn">
+<strong>这条结论会改变你的实施计划。</strong>2A 把 p90 的单次输出压到 2k 以下时，2B 的主要收益来源就消失了。为此设了一条硬规则「削减幂等性」：被 2A 处理过的消息打标记，2B 跳过；<code>double_reduced_count</code> 必须为 0（这是正确性断言，不是优化指标）。
+</div>
+
+<h2 id="s6">6 · 阶段 3 · 状态外部化</h2>
+
+<p><span class="tag">长期价值最高</span><span class="tag">5–6 天</span><span class="tag">不省 token，省可靠性</span></p>
+
+<h3>6.1 它是唯一"减少上下文同时提高可靠性"的机制</h3>
+<p>2A 和 2B 都在减少上下文，代价是信息变少。状态外部化把易丢失的隐式状态变成可验证的显式文件，五个收益都不随模型升级消失：抗遗忘、抗虚报、可恢复、可审计、人机共编。</p>
+
+<div class="fig">
+<svg viewBox="0 0 880 380" width="100%" role="img">
+<title>三个写者与一个注入块</title>
+<desc>harness 写事实、模型写判断、人写约束，三者落到状态目录的不同文件，只回注一个恒定大小的块。</desc>
+<defs><marker id="c" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#8A8880" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="40" y="40" width="240" height="62" rx="8" fill="#F1EFE8" stroke="#8A8880" stroke-width=".5"/>
+<text x="160" y="64" text-anchor="middle" font-size="13" font-weight="600" fill="#2C2C2A">harness</text>
+<text x="160" y="84" text-anchor="middle" font-size="11.5" fill="#5F5E5A">事实：改动 · 命令 · 测试结果</text>
+
+<rect x="320" y="40" width="240" height="62" rx="8" fill="#F1EFE8" stroke="#8A8880" stroke-width=".5"/>
+<text x="440" y="64" text-anchor="middle" font-size="13" font-weight="600" fill="#2C2C2A">模型</text>
+<text x="440" y="84" text-anchor="middle" font-size="11.5" fill="#5F5E5A">判断：方案 · 否决 · 遗留</text>
+
+<rect x="600" y="40" width="240" height="62" rx="8" fill="#F1EFE8" stroke="#8A8880" stroke-width=".5"/>
+<text x="720" y="64" text-anchor="middle" font-size="13" font-weight="600" fill="#2C2C2A">人</text>
+<text x="720" y="84" text-anchor="middle" font-size="11.5" fill="#5F5E5A">约束：不许动 · 验收标准</text>
+
+<line x1="160" y1="104" x2="160" y2="146" stroke="#8A8880" stroke-width="1.5" marker-end="url(#c)"/>
+<line x1="440" y1="104" x2="440" y2="146" stroke="#8A8880" stroke-width="1.5" marker-end="url(#c)"/>
+<line x1="720" y1="104" x2="720" y2="146" stroke="#8A8880" stroke-width="1.5" marker-end="url(#c)"/>
+<text x="160" y="128" text-anchor="middle" font-size="11" fill="#8A8880">只追加</text>
+<text x="440" y="128" text-anchor="middle" font-size="11" fill="#8A8880">须引用 fact id</text>
+<text x="720" y="128" text-anchor="middle" font-size="11" fill="#8A8880">模型只读</text>
+
+<rect x="40" y="150" width="800" height="70" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
+<text x="440" y="176" text-anchor="middle" font-size="13" font-weight="600" fill="#085041">.pi/state/</text>
+<text x="440" y="200" text-anchor="middle" font-size="11.5" fill="#0F6E56">plan.md · decisions.md · constraints.md · facts/&lt;session&gt;.jsonl · handoff.md</text>
+
+<line x1="440" y1="222" x2="440" y2="266" stroke="#8A8880" stroke-width="1.5" marker-end="url(#c)"/>
+<text x="456" y="248" font-size="11" fill="#8A8880">只取活跃集</text>
+
+<rect x="260" y="270" width="360" height="54" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
+<text x="440" y="302" text-anchor="middle" font-size="13" font-weight="600" fill="#085041">尾部注入块 · 约 500 token</text>
+
+<text x="40" y="356" font-size="12" fill="#5F5E5A">恒定大小，只出现在上下文尾部 —— 不随轮数增长，不破坏前缀缓存。</text>
+</svg>
+<p class="cap">图 5 · 三个写者、各写各的文件、只有一个消费口。</p>
+</div>
+
+<h3>6.2 核心机制（三条）</h3>
+<table>
+<tr><th style="width:150px">机制</th><th>内容</th><th style="width:180px">解决什么</th></tr>
+<tr><td><strong>按来源分权</strong></td><td>事实由 harness 写（只追加，模型只读）；判断由模型写（必须引用 fact id）；约束只有人能生效（模型越权写入被丢弃并计数）。三者物理分离到不同文件</td><td>判断不会被当成事实继承</td></tr>
+<tr><td><strong><code>done_when</code></strong></td><td>计划条目由模型写，但 <code>status</code> 由 harness 对可验证条件求值（<code>cmd_exit0</code> / <code>test</code> / <code>file_contains</code> / <code>git_clean</code>），模型不能改</td><td>消灭"宣布完成"的虚报倾向</td></tr>
+<tr><td><strong>可推翻条件</strong></td><td>每条 decision 必须写：引用、被否决的备选与原因、可推翻条件</td><td>结论不会变成不可质疑的教条</td></tr>
+</table>
+
+<h3>6.3 为什么"注入块恒定"是硬要求</h3>
+<p>如果注入块随轮数增长，它自己就成了新的膨胀源——Letta 的 memory block 就是这么烂掉的（没人修剪，涨到 8k token 每轮付费）。所以只注入活跃集：当前+下一步、全部生效约束、最近 3 条事实、未决判断、最多 3 条过期警告。验收要求 <code>inject_tokens</code> 的 P95/P50 &lt; 1.3。</p>
+
+<h3>6.4 唯一真正的验收：冷启动</h3>
+<p>任务做到 60% 杀掉进程，新会话<strong>只加载 <code>.pi/state/</code>、不给任何对话历史</strong>，看能否继续做完，成功率 ≥ 80%。在这条通过之前，前面所有实现都只算"写了一堆文件"。</p>
+
+<h2 id="s7">7 · 阶段 4 · 子 agent 隔离</h2>
+
+<p><span class="tag">最后做</span><span class="tag">收益真实但被高估</span></p>
+
+<h3>7.1 它解决什么</h3>
+<p>"宽而浅"的探索——搜代码、读文档、跑一遍测试看结果——不需要污染主上下文。子 agent 在自己的窗口里烧，只把结论送回来。</p>
+
+<h3>7.2 一个必须戳破的幻觉</h3>
+
+<div class="bad">
+<strong>"构造性无损压缩"是假的。</strong>边界上的返回也是压缩，而且<em>更不可验证</em>——你连原文都没有了。除非返回的是<strong>契约化产物</strong>：结构化结果 + 证据指针（文件路径 / sha / 行区间）。自然语言摘要不算。
+</div>
+
+<div class="fig">
+<svg viewBox="0 0 880 320" width="100%" role="img">
+<title>子 agent 的边界契约</title>
+<desc>任务 brief 进入子上下文，原文不回传，只有结论与证据指针穿过边界。</desc>
+<defs><marker id="d" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#8A8880" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="40" y="40" width="320" height="200" rx="10" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
+<text x="200" y="68" text-anchor="middle" font-size="13" font-weight="600" fill="#085041">主上下文</text>
+<text x="66" y="98" font-size="11.5" fill="#0F6E56">· 计划与进度（plan.md）</text>
+<text x="66" y="122" font-size="11.5" fill="#0F6E56">· 判断与约束（decisions / constraints）</text>
+<text x="66" y="146" font-size="11.5" fill="#0F6E56">· 最近 3 条事实（facts）</text>
+<text x="66" y="170" font-size="11.5" fill="#0F6E56">· 不包含：被探索路径的原文</text>
+<text x="66" y="200" font-size="11" fill="#7A9A8E">规模恒定，与子任务大小无关</text>
+
+<rect x="520" y="40" width="320" height="200" rx="10" fill="#F1EFE8" stroke="#8A8880" stroke-width=".5"/>
+<text x="680" y="68" text-anchor="middle" font-size="13" font-weight="600" fill="#2C2C2A">子上下文（独立窗口）</text>
+<text x="546" y="98" font-size="11.5" fill="#5F5E5A">· 完整任务 brief</text>
+<text x="546" y="122" font-size="11.5" fill="#5F5E5A">· 全部工具输出（自生自灭）</text>
+<text x="546" y="146" font-size="11.5" fill="#5F5E5A">· 可跑 30–100 轮不打扰主线</text>
+<text x="546" y="170" font-size="11.5" fill="#5F5E5A">· 结束后整体丢弃</text>
+<text x="546" y="200" font-size="11" fill="#8A8880">固定开销 5–10k（系统提示 + 工具定义）</text>
+
+<line x1="364" y1="108" x2="516" y2="108" stroke="#8A8880" stroke-width="1.5" marker-end="url(#d)"/>
+<text x="440" y="98" text-anchor="middle" font-size="11" fill="#5F5E5A">brief</text>
+<line x1="516" y1="176" x2="364" y2="176" stroke="#0F6E56" stroke-width="1.5" marker-end="url(#d)"/>
+<text x="440" y="196" text-anchor="middle" font-size="11" fill="#0F6E56">结论 + 证据指针</text>
+
+<text x="40" y="272" font-size="12" fill="#5F5E5A">穿过边界的只有两样：进去是 brief，出来是结论加证据指针。原文两边都不流通。</text>
+<text x="40" y="296" font-size="12" fill="#5F5E5A">所以"契约"不是礼貌，是唯一能保证可验证性的东西。</text>
+</svg>
+<p class="cap">图 6 · 边界的形状决定了隔离是否真的有损。</p>
+</div>
+
+<h3>7.3 什么时候不该拆（比"怎么拆"更重要）</h3>
+<table>
+<tr><th style="width:230px">情形</th><th>原因</th></tr>
+<tr><td>需要全局一致判断<br>（跨 20 文件改接口）</td><td>子 agent 各自局部正确，合起来错误。这类任务必须在一个上下文里做</td></tr>
+<tr><td>任务边界说不清</td><td>拆了要在边界来回传状态，比不拆更贵</td></tr>
+<tr><td>预估 &lt; 3 次工具调用</td><td>固定开销 5–10k 吃掉全部收益</td></tr>
+<tr><td>并行改同一片代码</td><td>必须配 worktree 隔离或文件锁，否则冲突比省下的钱贵</td></tr>
+</table>
+
+<h3>7.4 代价</h3>
+<p>错误传播（主 agent 无法验证子 agent 的结论，只能抽查证据指针）、可调试性下降（跨 session 追踪，需要 trace id 串联父子）、固定开销。度量要看 <code>subtask_cost_ratio</code>（子任务开销 / 省下的 token）与 <code>evidence_traceability</code>（返回物带证据指针的比例）。</p>
+
+<h2 id="s8">8 · 实施路线与决策点</h2>
+
+<div class="fig">
+<svg viewBox="0 0 880 260" width="100%" role="img">
+<title>实施路线</title>
+<desc>从度量到子 agent 隔离的推进顺序，中间有一个决定是否做 2B 的决策点。</desc>
+<defs><marker id="e" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#8A8880" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="34" y="118" width="106" height="58" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width=".5"/>
+<text x="87" y="142" text-anchor="middle" font-size="12.5" font-weight="600" fill="#0C447C">0 度量</text>
+<text x="87" y="160" text-anchor="middle" font-size="10.5" fill="#185FA5">1 天</text>
+<line x1="142" y1="147" x2="168" y2="147" stroke="#8A8880" stroke-width="1.5" marker-end="url(#e)"/>
+<rect x="172" y="118" width="106" height="58" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width=".5"/>
+<text x="225" y="142" text-anchor="middle" font-size="12.5" font-weight="600" fill="#0C447C">1 读取纪律</text>
+<text x="225" y="160" text-anchor="middle" font-size="10.5" fill="#185FA5">4 个半天</text>
+<line x1="280" y1="147" x2="306" y2="147" stroke="#8A8880" stroke-width="1.5" marker-end="url(#e)"/>
+<rect x="310" y="118" width="106" height="58" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
+<text x="363" y="142" text-anchor="middle" font-size="12.5" font-weight="600" fill="#085041">2A 削减</text>
+<text x="363" y="160" text-anchor="middle" font-size="10.5" fill="#0F6E56">必做</text>
+<line x1="418" y1="147" x2="470" y2="147" stroke="#8A8880" stroke-width="1.5" marker-end="url(#e)"/>
+
+<path d="M 494 126 L 518 147 L 494 168 L 470 147 Z" fill="#FAEEDA" stroke="#BA7517" stroke-width=".5"/>
+<text x="494" y="151" text-anchor="middle" font-size="10.5" fill="#854F0B">p90?</text>
+
+<path d="M 494 126 L 494 84 L 566 84" fill="none" stroke="#BA7517" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#e)"/>
+<rect x="570" y="58" width="130" height="52" rx="8" fill="#FAEEDA" stroke="#BA7517" stroke-width=".5" stroke-dasharray="4 3"/>
+<text x="635" y="80" text-anchor="middle" font-size="11.5" font-weight="600" fill="#854F0B">2B 移出</text>
+<text x="635" y="97" text-anchor="middle" font-size="10.5" fill="#BA7517">仅当 p90 &gt; 2k</text>
+
+<line x1="518" y1="147" x2="540" y2="147" stroke="#8A8880" stroke-width="1.5" marker-end="url(#e)"/>
+<rect x="544" y="118" width="106" height="58" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
+<text x="597" y="142" text-anchor="middle" font-size="12.5" font-weight="600" fill="#085041">3 状态</text>
+<text x="597" y="160" text-anchor="middle" font-size="10.5" fill="#0F6E56">5–6 天</text>
+<line x1="652" y1="147" x2="678" y2="147" stroke="#8A8880" stroke-width="1.5" marker-end="url(#e)"/>
+<rect x="682" y="118" width="106" height="58" rx="8" fill="#F1EFE8" stroke="#8A8880" stroke-width=".5"/>
+<text x="735" y="142" text-anchor="middle" font-size="12.5" font-weight="600" fill="#2C2C2A">4 子 agent</text>
+<text x="735" y="160" text-anchor="middle" font-size="10.5" fill="#5F5E5A">最后</text>
+
+<text x="34" y="212" font-size="11.5" fill="#5F5E5A">两个 go/no-go 点：① 阶段 1 第一步——pi 能否覆盖原生工具（不能则退化为提示词，应直接跳 2A）；</text>
+<text x="34" y="234" font-size="11.5" fill="#5F5E5A">② 2A 之后——若 p90 单次输出已低于 2k，2B 不值建，直接进阶段 3。</text>
+</svg>
+<p class="cap">图 7 · 2B 被画成虚线，因为它取决于实测数据，不取决于计划。</p>
+</div>
+
+<div class="bad">
+<strong>整套方案有一个共同的技术前提尚未验证：</strong>pi 的扩展能否覆盖原生工具、能否在组装层改写消息历史。这个不确认，阶段 1 和 2A 的收益都建立在一个假设上，2B 则完全无从谈起。<strong>验证它只要半天，应该排在所有实现之前。</strong>
+</div>
+
+<h2 id="s9">9 · 收益构成与代价</h2>
+
+<p>下表是量级估算（基于典型 coding 会话、工具输出占 50–70% 的假设），<strong>不是实测值</strong>，必须用阶段 0 在你自己的 session 上校准。</p>
+
+<table>
+<tr><th style="width:150px">机制</th><th style="width:190px">主要收益</th><th style="width:150px">量级（估算）</th><th>代价与风险</th></tr>
+<tr><td>阶段 1</td><td>减少单次读取</td><td><code>tokens_per_locate</code> −50%</td><td>大纲质量需持续维护；步数 +1</td></tr>
+<tr><td>2A</td><td>削掉超限输出与噪声</td><td>总量 −15~30%</td><td>中部信息风险（靠中部扫描兜）；落盘泄漏面</td></tr>
+<tr><td>2B</td><td>停止累积增长</td><td>长会话 −40~60%</td><td><code>1.15·S</code> 一次性代价；行为风险（可能增加重读）</td></tr>
+<tr><td>阶段 3</td><td>可靠性、可恢复、抗虚报</td><td>非 token 收益</td><td>5–6 天 + 长期维护；状态漂移风险</td></tr>
+<tr><td>阶段 4</td><td>隔离宽而浅的探索</td><td>主上下文 −20~40%</td><td>固定开销、跨 session 调试成本、错误传播</td></tr>
+</table>
+
+<div class="key">
+<strong>顺序的经济学：</strong>不产生（阶段 1）→ 少进来（2A）→ 移出去（2B）→ 记下来（阶段 3）。越靠前越便宜，越靠前越不依赖模型能力，也越不依赖 pi 扩展的钩子能力。所以哪怕整个插件只做了阶段 1 和 2A，也已经拿到大部分成本收益。
+</div>
+
+<h2 id="s10">10 · 能力边界、风险与术语</h2>
+
+<h3>10.1 它不承诺什么</h3>
+<ul>
+<li><strong>不让模型变聪明。</strong>它管的是账单和可靠性，不是能力。任务失败率不会因为装了它就下降（做对了也不会上升）。</li>
+<li><strong>不消除上下文。</strong>它只是让上下文"进来得少、留得短、记得住"。</li>
+<li><strong>不解决跨会话记忆。</strong>那需要另一套存储与检索，明确不在范围内。</li>
+<li><strong>不对短会话划算。</strong>回本曲线决定了 ≤10 轮的任务基本无感，甚至略亏。</li>
+</ul>
+
+<h3>10.2 风险清单</h3>
+<table>
+<tr><th style="width:230px">风险</th><th style="width:100px">可能性</th><th>缓解</th></tr>
+<tr><td>pi 扩展不支持覆盖原生工具</td><td>中</td><td>先花半天验证（图 7 的 go/no-go ①）；失败则只做 2A 的 bash 部分 + 阶段 3</td></tr>
+<tr><td>收益不及预期（瓶颈不在上下文）</td><td>中</td><td>阶段 0 先量；若 <code>effective_peak / window &lt; 0.4</code>，按成本而非质量决策</td></tr>
+<tr><td>维护成本吃掉收益</td><td>中高</td><td>每个机制独立开关 + 退场判据；宁可少做一个机制</td></tr>
+<tr><td>模型行为退化（重读、步数上涨）</td><td>中</td><td>只能靠真跑 A/B 发现；回放模拟测不出来</td></tr>
+<tr><td>状态漂移（文件与现实脱节）</td><td>中</td><td>sha 校验 + <code>done_when</code> 重算 + 标脏而非修正</td></tr>
+<tr><td>落盘内容泄漏密钥</td><td>低但严重</td><td>落盘前强制脱敏，宁可遮多</td></tr>
+<tr><td>pi 版本升级破坏契约</td><td>中</td><td>只依赖行为契约不依赖内部字段；未知 entry 类型跳过不报错</td></tr>
+</table>
+
+<h3>10.3 术语</h3>
+<table>
+<tr><th style="width:170px">术语</th><th>含义</th></tr>
+<tr><td><code>effective</code> / <code>raw</code></td><td>实际送进模型的 token / 历史全量 token（compaction 之前）</td></tr>
+<tr><td><code>S</code></td><td>改动点之后的内容大小。所有改写代价的唯一主导变量</td></tr>
+<tr><td><code>M</code> / <code>m</code></td><td>被削减/遮蔽的原文大小 / 替代记录的大小</td></tr>
+<tr><td>lag-1</td><td>观察之后隔一轮再移出，使 <code>S</code> 最小</td></tr>
+<tr><td>L0 / L1 / L2</td><td>可逆性等级：表示层 / 信息等价 / 有丢失（须落盘）</td></tr>
+<tr><td><code>done_when</code></td><td>计划条目的可验证完成条件，由 harness 求值，模型不能改</td></tr>
+<tr><td>stale</td><td>引用的 sha 已过期。标脏但不修正——世界变了，只有重新观察才知道变成了什么</td></tr>
+</table>
+
+<p style="margin-top:56px;padding-top:20px;border-top:1px solid #E8E6DE;font-size:12.5px;color:#8A8880">
+细节实现见各阶段独立文档：<code>phase-0-metrics-design.md</code>、<code>phase-1-read-discipline-design.md</code>、<code>phase-2-reduction-design.md</code>、<code>phase-3-state-externalization-design.md</code>、<code>lag1-masking-design.md</code>。
+</p>
+
+</div>
+</body>
+</html>
