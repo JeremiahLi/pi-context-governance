@@ -36,6 +36,10 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 <p class="sub">阶段 0–4 全景：框架、原理、能力边界与取舍</p>
 <p class="meta">v1.0 · 2026-10-30 · 配套文档：<code>phase-0</code> ~ <code>phase-3</code>、<code>lag1-masking-design</code>、<code>pi-context-compression-prd-v0.1</code></p>
 
+<div class="warn">
+<strong>已修订（2026-11-02）：</strong>本页的阶段顺序、成本倍率与阶段 1 的默认阈值以 <code>adr-0001-quality-first-defaults.md</code> 为准。要点：新顺序为 <strong>0 → 2A（仅无损）→ 3 → 2B → 1 → 4</strong>；阶段 1 的 outline 默认阈值由 300 行改为 1500 行；成本模型需按 provider 参数化（本项目跑 OpenAI / DeepSeek，无缓存写入溢价）；2C 已删除。第 8 节的路线图与本文冲突时以 ADR 为准。
+</div>
+
 <div class="toc">
 <div><a href="#s0">0 · 一页速览</a></div>
 <div><a href="#s1">1 · 为什么做，以及不做什么</a></div>
