@@ -248,7 +248,7 @@ tests/auth.spec.ts 2
 |---|---|---|
 | 截断阈值 | `a7.hardCapTokens = 20000`（唯一定义见 phase-2 §7） | 超出：head + tail + 中部扫描 + 落盘；未超出则原样返回 |
 
-落盘路径：`~/.pi/agent/state/<projectId>/blobs/bash-<callId>.log`（见 `interface-contract.md` §3），返回时给出可直接 `read` 的路径。
+落盘路径：`~/.pi/agent/state/<projectId>/blobs/bash-<callId>.log`（见 `interface-contract.md` §3）。**返回给模型的指针是 `recall(entryId)`，不是这个路径**（v1.3）——blob 在 `~/.pi/agent/` 下，而模型的 `read` 以工作目录为根，写 `read("blobs/...")` 会让它去仓库里找一个不存在的文件。路径只用于 harness 内部回读与审计（contract §3 规则 3）。
 
 **v1.2 删除了软上限（原 `200 行 / 8KB`）。** 理由与 A7 降级为紧急制动是同一条：截断发生在模型看到之前，属于整场会话内的永久信息损失，而 2B 是"看过之后拿走"、可 recall。两份文档同时实现的话，模型的 bash 输出在 300 行时就被切了——A7 的降级完全失效，2B 想接手的日常削减根本轮不到它。
 
@@ -285,7 +285,7 @@ v1.1 的例子是"812 行 / 63KB → 已截断"，那是软上限时代的产物
 
 v1.1 写的是"阈值在阶段 1 的配置里，模板在阶段 2A 的配置里"，并在 §11 保留了 `bash.softLines/softBytes = 200/8192`。这与 phase-2 §3.3「日常输出不截断，只有超过 20k 才截」直接冲突——两份文档同时实现，模型的 bash 输出在 300 行就被切掉，A7 的降级完全失效。根源不是笔误，是"交接给错了人"：把阈值交给了一个还停留在 v1.0 原则的模块。
 
-另外，**2A 的行级清洗（A2–A6）不作用于 `read` / `grep` 的正文**，只做 A1（ANSI）、A8（解码容错）与脱敏。原因见 phase-2 §3.1：`read`/`grep` 返回的是可被 `edit` 回写的源码文本，任何行级变换都会让行号与 `oldText` 同磁盘脱节，直接撞 I7。
+另外，**2A 的行级清洗（A2–A6）不作用于 `read` / `grep` 的正文**，只做 A1（ANSI）与 A8（解码容错）；**脱敏也不作用于源码正文**（v1.3）。原因见 phase-2 §3.1：`read`/`grep` 返回的是可被 `edit` 回写的源码文本，任何行级变换都会让行号与 `oldText` 同磁盘脱节，直接撞 I7；脱敏同理——它把 `authorization: "Bearer ..."` 遮成 `Bearer ***` 之后，`oldText` 一样匹配不上。作用域唯一版本见 `interface-contract.md` §5.1。
 
 ---
 
@@ -407,7 +407,7 @@ v1.1 写的是"阈值在阶段 1 的配置里，模板在阶段 2A 的配置里"
 | `read_tokens_p50/p90` | 单次 read 的 token 分布 | p90 < 3k |
 | `outline_hit_rate` | 大文件中走 outline 的比例 | > 80% |
 | `forced_full_read_rate` | `full:true` 占比 | 5%–20%（过低说明重构类任务被压抑，过高说明 outline 不够用） |
-| `re_read_rate` | 同 path 重复读取比例 | 绝对值 < 10% **且** 增幅 < 20%（与 lag1 §13.1 同一定义，见 `interface-contract.md` §7） |
+| `re_read_rate` | 同 path 重复读取比例 | **相对增幅 < 20%**；绝对值 < 10% 仅当基线低于 10% 时并用（与 lag1 §13.1 同一定义，见 `interface-contract.md` §7） |
 | `truncation_rate` | 阶段 2A 截断触发率（定义见 phase-2 §8，此处不重定义） | < 5% |
 | `steps_per_task` | 步数 | 不增（允许 +5%） |
 | `task_success` | 成功率 | 不降 |

@@ -402,7 +402,9 @@ v1.1 的"`< 3× 单块预算`"是个妥协值：它容忍两块，等于承认�
 这是判断"状态是否真的外部化了"的唯一方法。流程：
 
 1. 任务做到第 60%，杀掉进程
-2. 新会话启动，只加载 `.pi/state/`（不加载任何对话历史）
+2. 新会话启动，只加载 `<repo>/.pi/state/` **与事实日志**（`~/.pi/agent/state/<projectId>/facts/*.jsonl`，只读），**不加载任何对话历史**
+
+   > v1.3 补：v1.2 这里只写"只加载 `.pi/state/`"，但 §10.2 的 `handoff.md` 里引用了 `f_7b1`、`f_7a3` 这类事实 id——那些 id 的正文在仓库外的 `facts/` 里。不给事实，交接包里的证据引用全是悬空的，冷启动等于只给了结论没给依据。加载事实索引（id + 一行摘要）而不加载全文，是这一步的正确粒度。
 3. 生成 `handoff.md` 作为第一条注入
 4. 继续做，看能否完成
 
@@ -493,7 +495,26 @@ compaction 之后，历史被摘要替代，但 state 完整保留。**这就是
 
 **保护不能只做在状态 API 上。** 模型有通用的 `edit` / `write` 工具，它知道 `.pi/state/` 的路径——只要它想写，就能直接改文件，绕过所有语义层的检查。v1.1 只写了"模型写生效区 → 丢弃"，没有说明这条检查挂在哪一层，实现时最省事的做法就是挂在状态 API 上，然后被一次普通 `edit` 绕过去。
 
-守卫必须下沉到工具入口：任何对 `.pi/state/**` 的写请求，先解析出**改动的行区间**，再按受保护区判定。
+守卫必须下沉到工具入口：任何对受保护根目录的写请求，先解析出**改动的行区间**，再按受保护区判定。
+
+#### 12.3.1 受保护的是两个根，不是一个（v1.3）
+
+v1.2 只写了 `.pi/state/**`。但 v1.2 自己刚把 `facts/`、`masks.jsonl`、`blobs/` 全部搬到了 `~/.pi/agent/state/`——**搬出去的这些东西恰好是全裸的**。`edit` / `write` 接受绝对路径，模型只要写 `C:\Users\x\.pi\agent\state\<pid>\facts.jsonl` 就能直接伪造成事实，绕过 §5 的全部来源检查。
+
+| 根 | 内容 | 保护强度 |
+|---|---|---|
+| `<repo>/.pi/state/` | `plan.md` / `decisions.md` / `constraints.md` / `handoff.md` | 按行区间判（下表） |
+| `~/.pi/agent/state/` | `facts.jsonl`、`masks.jsonl`、`pins.json`、`blobs/`、`metrics.jsonl`、`offsets.json` | **整目录只写——模型一次都不许写** |
+
+两个根都要先 `realpath` 归一化再比较，否则绕过方式太多：
+
+- Windows：`\\?\C:\...` 长路径前缀、8.3 短名（`PROGRA~1`）、大小写不敏感（`C:\Users` vs `c:\users`）、`/` 与 `\` 混用、目录联接（junction）
+- POSIX：符号链接、`..` 未折叠
+- 通用：`write` 到一个父目录是符号链接的新文件
+
+实现上统一走一次 `os.path.realpath` + `casefold`（Windows）再前缀比较，**不要**用字符串 `startswith` 直接比原始路径。
+
+`~/.pi/agent/state/` 下的写入只有 harness 自己能做（进程内的 append 接口），不经过工具层。所以这里的守卫是纯拒绝，没有允许列表。
 
 | 文件 / 区域 | 模型可写 | 违规处理 |
 |---|---|---|
@@ -503,8 +524,9 @@ compaction 之后，历史被摘要替代，但 state 完整保留。**这就是
 | `constraints.md` 的 `## 生效` 区 | ❌ | 丢弃 + `rejected_write` |
 | `constraints.md` 的 `## 待确认` 区 | ✅（只允许追加） | — |
 | `decisions.md` 的历史条目 | ❌ 删除/改写；✅ 追加 | 拒绝，提示"用追加 + 标已推翻" |
-| `facts/**` | ❌ 任何写入 | 拒绝（事实只能由 harness 追加） |
+| `facts.jsonl` | ❌ 任何写入 | 拒绝（事实只能由 harness 追加） |
 | `handoff.md` | ✅（需带 `[人]` 标记） | — |
+| `~/.pi/agent/state/**`（全部） | ❌ 任何写入 | 拒绝 + `rejected_write`（v1.3） |
 
 **判定粒度是行区间，不是整个文件**：改 `plan.md` 的条目正文是允许的，同一文件里的 `status` 行不允许，所以必须先定位 `oldText` 落在哪个区。
 
@@ -523,6 +545,7 @@ compaction 之后，历史被摘要替代，但 state 完整保留。**这就是
 | key | 默认 | 说明 |
 |---|---|---|
 | `state.dir` | `<repo>/.pi/state` | 计划 / 判断 / 约束 / 交接 |
+| `state.root` | `~/.pi/agent/state/<projectId>` | 仓库外根，整个目录对模型只读（§12.3.1） |
 | `state.factsDir` | `~/.pi/agent/state/<projectId>/facts` | **仓库外**（v1.2 变更，理由见 §3） |
 | `inject.budgetTokens` | `500` | 目标 500，硬上限 800 |
 | `inject.transient` | `true` | **不写入 session**，只在请求尾部临时拼接（§8.4）。**关掉它等于回到会累积的旧方案** |
@@ -572,9 +595,11 @@ compaction 之后，历史被摘要替代，但 state 完整保留。**这就是
 4. **注入不累积**：50 轮会话里单块 `inject_tokens` 的 P95/P50 < 1.3，`inject_tokens_total / inject_tokens < 1.6`，且 **`inject_persisted = 0`**（§8.4）
 5. **人改生效且不被覆盖**：人设 `override: done` 后，连续三轮 harness 重算仍显示 override 与冲突提示；`status` 字段被更新但 `override` 未被改写（§12.2）
 6. **越权拦截覆盖 `edit`/`write` 路径**：不只测状态 API——直接用 `edit` 改 `plan.md` 的 `status` 行、改 `constraints.md` 生效区、写 `facts/`，全部被拒并计数（§12.3）
-7. **崩溃安全**：facts 末行残缺时能正常加载
-8. **脱敏**：facts 与注入块中无明文密钥；构造含 JWT、`postgres://user:pass@host`、`.env` 整行的命令输出，三者在 facts 里都不出现明文（contract §5 规则 3/5/7）
-9. **facts 不在仓库内**：`git status` 中不出现 `facts/`，`git check-ignore` 对它返回非零（它根本不在仓库树里，不是被忽略了）
+7. **越权拦截覆盖第二个根**（v1.3）：用绝对路径直接 `write` 到 `~/.pi/agent/state/<pid>/facts.jsonl`、`masks.jsonl`、`blobs/<id>.log`，全部被拒。再用 `\\?\C:\...` 前缀、8.3 短名、大小写变体、父目录为 junction 的四条变体各试一次，全部被拒（§12.3.1）
+8. **崩溃安全**：facts 末行残缺时能正常加载
+9. **脱敏**：facts 与注入块中无明文密钥；构造含 JWT、`postgres://user:pass@host`、`.env` 整行的命令输出，三者在 facts 里都不出现明文（contract §5 规则 3/5/7）
+10. **脱敏不越界**：`read` 一个含 `authorization: "Bearer sk-xxxx"` 的源码文件，返回值必须是原文（contract §5.1）
+11. **facts 不在仓库内**：`git status` 中不出现 `facts/`，`git check-ignore` 对它返回非零（它根本不在仓库树里，不是被忽略了）
 
 ---
 
@@ -589,6 +614,8 @@ compaction 之后，历史被摘要替代，但 state 完整保留。**这就是
 | **最早的约束莫名消失** | 用了"按时间倒序截断" | 改为优先级降级 + 不截断（§7.1）；未标注优先级的按 P0 处理 |
 | **人改的 done 下一轮变回 blocked** | harness 重算覆盖了同一个 `status` 字段 | 引入独立 `override` 字段，重算只写 `status`（§12.2） |
 | **模型绕过写保护** | 守卫只挂在状态 API 上，模型用普通 `edit` 改文件 | 守卫下沉到 `edit`/`write` 入口，按行区间判定（§12.3） |
+| **模型伪造事实 / 改遮蔽记录** | 守卫只覆盖 `.pi/state/**`，而 `facts`/`masks`/`blobs` 在 `~/.pi/agent/state/`，`edit` 接受绝对路径 | 两个根都保护，`~/.pi/agent/state/**` 整目录只读（§12.3.1）；试 `\\?\C:`、8.3 短名、大小写、junction 各一条回归用例 |
+| **模型把 `read` 的 blob 当成可写文件** | 指针模板给了 `blobs/` 相对路径 | 指针只用 `recall(entryId)`（contract §3 规则 3），blob 路径不进模型可见输出 |
 | **步骤被平凡谓词判为完成** | `done_when` 由模型写且未审核 | 静态检查 + 人确认（§4.2）；监控 `trivial_predicate_rejected` |
 | facts 里出现明文密钥 | 脱敏规则不全（JWT / 连接串 / `.env`） | 用 contract §5 的七条规则；并且 facts 本身不在仓库内（§3） |
 | plan 变成谎言堆 | status 被模型改写 | status 只由 harness 写；越权写入丢弃 |
@@ -673,3 +700,16 @@ compaction 之后，历史被摘要替代，但 state 完整保留。**这就是
 | **`facts/` 移出仓库**（§3） | `<repo>/.pi/state/facts/`，`.gitignore` 建议排除 | "建议"不是"强制"，一次 `git add .` 就进去了；命令输出里的泄漏面比黑名单正则能覆盖的大。参数化到 `state.factsDir` |
 | 脱敏引用 contract（§13） | "见阶段 2 §3.5"（四条正则，且 `$1` 是空） | 统一到 `interface-contract.md` §5 的七条；补 JWT / 连接串 / `.env` |
 | 验收 +2 条、失败模式 +6 行（§15、§16） | — | 覆盖优先级降级、override 不被覆盖、edit 路径绕过、平凡谓词、facts 位置 |
+
+**v1.3 · 2026-11-02**
+
+| 位置 | v1.2 的错误 | 后果 |
+|---|---|---|
+| §12.3 / 新增 §12.3.1 | 写保护只覆盖 `<repo>/.pi/state/**` | v1.2 刚把 `facts/`、`masks.jsonl`、`blobs/` 搬到 `~/.pi/agent/state/`，这些恰好全裸。`edit`/`write` 接受绝对路径，模型能直接伪造事实、改遮蔽记录。改为两个根都保护，仓库外整目录只读，并补 `realpath` 归一（`\\?\` 前缀、8.3 短名、大小写、junction） |
+| §13 配置 | 只有 `state.dir` / `state.factsDir` | 补 `state.root` |
+| §15 验收 | 第 6 条只测 `.pi/state/` | 新增第 7 条（第二个根 + 四种路径变体）、第 10 条（脱敏不越界） |
+| §16 失败模式 | 无 | 补"模型伪造事实/改遮蔽记录"、"模型把 blob 当可写文件" |
+
+I4 的降级（lag1 §4.1）不改变本文任何内容：三个信号里 `coverAfter` 由 2B 自己判定，`done_when` 求值只是把第一条信号做得更准，不是前提。
+
+另修 §10.1：v1.2 的冷启动写"只加载 `.pi/state/`"，但 `handoff.md` 里引用了 `f_7b1` 这类事实 id，正文在仓库外的 `facts/`。改成"state + 事实索引只读"，否则交接包里的证据引用全是悬空的。

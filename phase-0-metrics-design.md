@@ -193,7 +193,7 @@ input_tokens, cache_read_input_tokens, cache_creation_input_tokens, output_token
   "provider": "deepseek",
   "M": 12480,            // 区段内 ΣM
   "m": 280,              // 区段内 Σm
-  "S": 2240,             // 只算一次：span[0] 之后、上一轮已进入缓存的部分
+  "S": 2240,             // span.last 之后 + 区段内空洞；**不含被遮项原文**
   "delta": 928,
   "paybackTurns": 0.75,
   "caliber": "actual",   // actual（I4 三信号）| strict（只认 conclusionRef）
@@ -288,22 +288,36 @@ input_tokens, cache_read_input_tokens, cache_creation_input_tokens, output_token
 **算法（逐轮递推，且必须复用实现的判定函数）**：
 
 ```
-state: maskedIds = {}, effective[t]
+state: maskedIds = {}, effective[t], unprofitable = 0
 for t in turns:
-    # 1) 取"本轮会推进的区段"——直接调用 lag1 §5.3 的 computeEligible，不另写一套筛选
-    span = computeEligible(context(t), config)      # 同一函数、同一 config、同一 minTokens/ratio
+    ctx = context(t)
+    # 1) 取本轮会推进的区段——直接复用 lag1 §5.3 的 computeEligible，不另写一套筛选
+    span, holeM = computeEligible(ctx, pastCacheEnd(t), config, frozen=maskedIds)
     if span 非空:
-        M_total = Σ tokens(i)            for i in span
-        m_total = Σ estimateMaskTokens(i) for i in span
-        S = cachedTokensAfter(span[0], context(t))  # 只算一次：代价由最早的改动点决定
+        M_total = Σ tokens(i)              for i in span
+        m_total = Σ estimateMaskTokens(i)  for i in span
+        # S 只含"被迫重算但自身不变小"的部分：区段最后一条之后 + 区段内空洞
+        S = cachedTokensAfter(span.last, pastCacheEnd(t)) + holeM
         Δ = w*m_total + (w - c)*S - c*M_total       # c/w 取自 §3.2 的 provider 表
-        n = max(0, Δ) / (c*(M_total - m_total))
+        n = max(0, Δ) / (c*(M_total - m_total))  if M_total > m_total else ∞
         paybackOk = c*(M_total - m_total)*(R - t) > w*m_total + (w - c)*S
-        emit SimEvent(atTurn=t, span=[...], M=M_total, S=S, Δ=Δ, n=n, paybackOk=paybackOk)
-        maskedIds |= set(span)
+        emit SimEvent(atTurn=t, span=span, M=M_total, m=m_total, S=S, Δ=Δ, n=n, paybackOk=paybackOk)
+        maskedIds |= set(span)                     # 主曲线按"实际会遮的"走，不看 paybackOk
+        if not paybackOk: unprofitable += 1
     # 2) 计算本轮 effective（被遮蔽的用 m 替代）
     effective[t] = sum(m if id in maskedIds else tokens(...))
 ```
+
+**四个必须做对的地方**（v1.3）：
+
+| 项 | 错法 | 后果 |
+|---|---|---|
+| **`S` 取区段末尾**，不是区段开头 | `cachedTokensAfter(span[0])` | 区段第 2 条到最后一条既在 `M_total` 又在 `S`，被算两遍。两条各 12k 时 `Δ` 从 −2080 变成 +8720，**DeepSeek 上会得出"先别做 2B"** |
+| **`holeM` 要累加** | 忽略区段内被跳过的 pin/小额项 | 这些项随改动点一起重算、原文不变小，确实进 `(w−c)` 项。漏掉会低估代价（但这个方向错得少，因为空洞通常不大） |
+| **`frozen=maskedIds` 传入** | 不传 | 已遮过的条目每轮重新入选，占满 `maxSpanPerTurn` 名额，新条目永远轮不到——模拟出的收益曲线从第 8 条起就平了 |
+| **`paybackOk` 只做统计，不做门控** | 用 `paybackOk` 决定是否 `maskedIds |= span` | 判据占比会变成"我自己决定遮哪些"的循环论证。v1.2 的写法是**先无条件遮、再单独统计不合算的比例**，两数才能互相校验 |
+
+**`paybackOk` 与运行时门控的关系要说清**：`§5.1` 的四个触发条件里**没有** `paybackOk`——它决定的是"2B 值不值得做"（go/no-go），不是"这一条要不要遮"（运行时）。所以主收益曲线按 `computeEligible` 走，另外单列一条"若只遮 `paybackOk` 为真的那些"作为敏感性。两条曲线的差值告诉你会话里有多少遮蔽属于"单看回本不划算、但被后续轮次摊平"的长尾。
 
 **这一版与 v1.1 的两处差别都是硬要求**：
 
@@ -317,7 +331,7 @@ for t in turns:
 - `strict` 口径：I4 只认 `conclusionRef`（即"必须被 decision 点名"）→ 给出**收益下界**
 - `actual` 口径：I4 三信号任一 → 给出**上线预期**
 
-两口径的差值本身就是信息：**差得越多，说明阶段 3 的 decision 覆盖越不足，2B 的收益越依赖 `coverAfter` 这条弱信号**。此时不应该调 2B 的参数，应该回去加强 `requireDecisionPerStep`。
+两口径的差值本身就是信息：**差得越多，说明收益越依赖 `coverAfter` 这条弱信号，而不依赖 decision 引用**。这时有两个可选动作——(a) 调 2B 的参数（`coverAfter` 从 2 放宽到 3）；(b) 如果阶段 3 已上线，回去加强 `requireDecisionPerStep`。两者都不改变一个事实：**2B 不依赖阶段 3 也能运行**，`coverAfter` 单独就能让 `use_opportunity_coverage` 到 100%（contract §6）。
 
 三个必须一起输出的东西：
 
@@ -490,3 +504,12 @@ input,cache_read,cache_write,output,overhead_est,compaction,masked_sim,sim_savin
 | 只读断言分活跃/已关闭（§7、§10 验收 4） | 全文 sha256 前后一致 | 活跃会话在扫描期间必然被追加，一刀切会让最值得分析的会话稳定退出码 3 |
 | `SimEvent` 结构改为区段级（§4） | 单消息级，`entryId` | 与"一轮一区段"对齐，新增 `span` / `caliber` / `paybackOk` |
 | "阶段 4 真跑" → lag1 的 M4（§6.5） | 阶段 4 | 总览里的阶段 4 是子 agent 隔离，与遮蔽 A/B 无关 |
+
+**v1.3 · 2026-11-02**
+
+| 改动 | 原内容 | 原因 |
+|---|---|---|
+| **模拟的 `S` 改为"区段末尾 + 空洞"**（§6.5、§4） | `cachedTokensAfter(span[0])` | 与 lag1 v1.2 同源错误：区段第 2 条起既在 `M_total` 又在 `S`，被算两遍。两条各 12k 时 `Δ` 从 −2080 变 +8720，DeepSeek 上会得出"先别做 2B" |
+| `holeM` 进入 `S`（§6.5） | 忽略区段内被跳过项 | 这些项随改动点重算、原文不变小，确实计费 |
+| `frozen=maskedIds` 传入（§6.5） | 不传 | 已遮条目每轮重新入选、占满名额，收益曲线从第 8 条起就平了 |
+| `paybackOk` 明确为统计而非门控（§6.5） | 措辞暗示两者联动 | 运行时触发条件里没有它；先无条件遮、再单独统计不合算比例，两数才能互校。另出"只遮划算的"敏感性曲线 |

@@ -233,7 +233,13 @@ pinned: 用户显式豁免，永不遮蔽（**只从 fresh 进入**；已 masked
 
 1. **使用机会覆盖**（I4，三信号任一）：被某条 decision 引用；或所属步骤已收尾；或其后已出现 ≥ `coverAfter`（默认 2）条新结果。
 2. **滞后满足**：它的位置之后，至少还有一条**完整的** tool result message（I1）。
-3. **体量达标**：`M ≥ max(minTokens, minRatioOverSuffix × S)`（默认 `1000` 与 `4×S`）。门槛来自 §2.4 的回本公式，作用是拦住"遮了但回不了本"的小输出。**`4×S` 的真实含义是"回本 ≤ 1.5 轮"**（DeepSeek 口径重算，见 `interface-contract.md` §4；v1.1 注释写"回本 ≤ 4 轮"是算错的）。OpenAI（c=0.5）上 `1×S` 就已立赚——**这个默认值对 OpenAI 偏保守，保守降低收益但不降低质量，不改**。
+3. **体量达标**：`M_total ≥ max(minTokens, minRatioOverSuffix × S)`，**按整段判定**（见 §5.3 约束 3），默认 `1000` 与 `1×S`。
+
+   **默认值由 `4` 改为 `1`（v1.3）**。原值的语义从来没说清：注释写"对应回本 ≤ 4 轮"，按公式重算实际是 1.27–1.48 轮。而"回本 ≤ 1.5 轮"这种要求会把 `M=12k / S=7k` 也拒掉——按 §2.4 的公式它是 4.4 轮回本（`Δ = 160 + 0.9×7000 − 1200 = 5260`，每轮省 `1184`），只要会话还剩 5 轮以上就是划算的，而"会话还剩多少轮"正是 `paybackOk` 负责的事。
+
+   门槛的唯一职责是筛掉"改动代价已经大于这一刀的节省"的最坏情形，即 `M < S`。真正的经济决策交给 `paybackOk`。**注意门槛 ≠ 立赚**：`Δ ≤ 0` 需要 `M ≥ 9S + 10m`（DeepSeek），门槛 1 远不到那里，它只是防止用大改动去换小节省。
+
+   两个门槛分工不清，是 v1.1 留下的第二处会计错误。
 4. **不在豁免集**：未被 pin（用户正在看的、正在 debug 的）。
 
 ### 5.2 遮蔽单位：message，不是 block
@@ -264,32 +270,65 @@ pinned: 用户显式豁免，永不遮蔽（**只从 fresh 进入**；已 masked
 | **暂时不合格** | 未获得使用机会（I4 三信号都不满足） | **挡住**。其后任何一条本轮都不遮 |
 
 ```
-function computeEligible(msgs, config):
+function computeEligible(msgs, pastCacheEnd, config):
     lastResultIdx = 最后一个满足 isToolResultMessage 的索引
-    span = []
-    for i in msgs 索引顺序:
-        if i >= lastResultIdx: break                    # I1：最后一条结果及其后不动
-        if not isToolResultMessage(msgs[i]): continue    # 非结果消息不参与区段
 
-        # —— 永久不合格：跳过，不挡游标（否则小额输出会让游标永久停摆）
-        if pinned(msgs[i]):                          continue
-        if absorbed(msgs[i]):                        continue
-        if tokens(msgs[i]) < config.minTokens:       continue
+    # 1) 收集候选：永久不合格越过，暂时不合格截断
+    base   = []          # 区段内会被遮蔽的消息
+    holeM  = 0           # 区段内部被跳过项的原文 token（进 (w−c) 项，见约束 2）
+    started = false
+    for i in 0 .. lastResultIdx-1:
+        if not isToolResultMessage(msgs[i]): continue
+        if frozen(msgs[i]):                  continue   # 已冻结：跳过，且不占名额（约束 5）
 
-        # —— 暂时不合格：挡住游标（否则就是 FIFO 回退，S 变成整段历史）
-        if not hasUseOpportunity(msgs[i], config):   break
+        if pinned(msgs[i]) or absorbed(msgs[i]) or tokens(msgs[i]) < config.minTokens:
+            if started: holeM += tokens(msgs[i])       # 只有落在区段内部的空洞才计费
+            continue
 
-        span.push(i)
-        if span.length >= config.maxSpanPerTurn:     break   # 单轮推进上限
-    return span
+        if not hasUseOpportunity(msgs[i], config): break   # 暂时不合格：截断，不许跳过
+        base.push(i); started = true
+        if base.length >= config.maxSpanPerTurn:      break   # 单轮推进上限
+
+    # 2) 整段判价：不达标就丢掉最早那条重试，不 break（约束 3）
+    while base 非空:
+        M = Σ tokens(msgs[i])               for i in base
+        m = Σ estimateMaskTokens(msgs[i])   for i in base
+        S = cachedTokensAfter(msgs[base.last], pastCacheEnd) + holeM   # 约束 1
+        if M >= max(config.minTokens, config.minRatioOverSuffix * S):
+            return base
+        base  = base[1:]                   # 最早那条视为永久留下
+        holeM = recomputeHoleM(base)        # 新起点之前的空洞不再计费
+    return []
 ```
 
-三条实现约束：
+五条实现约束（v1.3 重新编号）：
 
-1. **区段从前端开始，但中间可以有空洞**。越过一个 pin 项之后继续向后推进是允许的——改动点仍然是 `span[0]`，`S` 仍然是"`span[0]` 之后、上一轮已缓存"的全部内容，跳过中间某一条**不产生额外缓存代价**。v1.1 写的"中间遇到不可遮的即断开"把这件事搞错了：它让一条 pin 或一条小额输出永久冻住整个机制。
-2. **暂时不合格必须 break，不能 continue**。这是 I2 与成本模型的要求，不是风格问题：`continue` 等于"先遮后面、等前面后来合格再补"，那时改动点在前面，`S` 就是中间夹着的整段历史。
-3. **`maxSpanPerTurn` 是安全阀**（默认 8 条）。一个长步骤收尾后可能一次性释放二十几条候选，全遮的话 `S` 会覆盖整个步骤。分两三轮推进的代价是两次 `(w−c)×S`，但每次的 `S` 只有前一次的一半左右，且模型不会一次性失去二十几条证据。
-4. **已冻结的遮蔽不受 pin 影响**（v1.2 补）。`masks.jsonl` 里已有记录的位置是终态（I3），`pinned()` 只对**尚未遮蔽**的位置生效。否则用户新增一个 pin 会让历史位置"复活"——边界回退、那段前缀全部失效。而加 pin 的动机恰恰是"我刚发现这个文件要 debug"，是高频操作，不能每次都付一次全量重算。这条与状态机一致：`masked` 是终态，`pinned` 只能从 `fresh` 进入。
+1. **`S` 不含区段内部被遮蔽的原文**。`S` 只有两部分：区段**最后一条之后**、上一轮已缓存的全部内容，加上区段**内部被跳过**的项（pin / 小额）。后者随改动点一起重算、但自身不变小，所以计入 `(w−c)` 项；前者同理。被遮蔽项的原文只出现在 `M` 里，绝不出现在 `S` 里。
+
+   v1.2 写的是 `cachedTokensAfter(span[0])`——"第一条之后"。区段里第 2 条到最后一条既在 `M_total` 里、又在这个 `S` 里，被算了两遍。两条各 12k、`m=160`、区段之后无后缀、DeepSeek：
+
+   | | 算式 | 结果 |
+   |---|---|---|
+   | 正确 | `Δ = 320 + 0.9×0 − 0.1×24000` | **−2080**（立赚） |
+   | v1.2 | `Δ = 320 + 0.9×12000 − 2400` | **+8720**（看起来大亏） |
+
+   多出来的正好是 `(w−c)` 乘上"除第一条以外的区段原文"。而 `maxSpanPerTurn = 8` 正是为批量遮而设的——**批量恰恰是误价最严重的情形**。阶段 0 若沿用，会在 DeepSeek 上系统性得出"先别做 2B"。
+
+2. **中间可以有空洞，但空洞不是免费的**。区段内部被跳过的项（pin、小额）不会被改写，却会因为改动点在前而整段重算：它们的原文进入 `(w−c)` 项。v1.2 说"跳过中间某一条不产生额外缓存代价"是错的——那句话只在"已经决定遮 `span[0]`"的前提下成立（洞的代价已经付了），相对"不遮"它确实是一笔成本。
+
+   推论：**pin 是天然的区段左边界，不是右边界**。`started` 之前遇到的 pin 直接 `continue`，此时它是已缓存前缀，代价为零；一旦区段起点跨到 pin 之前，它立刻变成必须重算的洞。取 `m1=12k`、`m2=8k`(pin)、`m3=12k`（contract §4.4）：起点落在 pin 之后 `Δ = −1040`；跨过 pin 批量遮 `Δ = +5120`；把 pin 当右边界（只遮 `m1`）`Δ = +16960`——最差。所以约束 3 的"丢弃最早项"在洞很大时正好能把起点推到 pin 之后，方向是对的，不要为了"顺手多遮一条"去跨过一个很大的 pin。
+
+3. **整段判价，不达标就丢弃最早项**。`minRatioOverSuffix` 是整段判据（`M_total` 对上面那个真正的 `S`），不能逐条塞进循环：第一条的 `S` 会包含同区段其余原文，`M < ratio×S` 几乎必然成立，批量遮蔽会被自己的门槛关掉。
+
+   不达标时**丢弃最早那条**，不要让游标停在它上面。理由：`S` 只会随等待变大（内容只增不减），挡住游标等于死锁；而丢弃之后改动点后移、`S` 变小，后面的候选反而可能达标。被丢弃的项视为永久留下——不需要额外状态，因为下一轮重算时 `S` 只会更大，它自然仍不达标。
+
+4. **暂时不合格必须 break，不能 continue**。`continue` 等于"先遮后面、等前面后来合格再补"，那时改动点在前面，`S` 就是中间夹着的整段历史。
+
+5. **已冻结的不占名额，且不受 pin 影响**。`frozen()` 检查必须放在体积判断**之前**——否则已遮过的大结果每轮都重新入选，按原始 `M` 占满 8 个名额，后面的新结果永远轮不到；而若拿遮蔽后的 160 token 去比 `minTokens`，把 `minTokens` 调到 160 以下它们又会回来。同时 `masks.jsonl` 里已有记录的位置是终态（I3），`pinned()` 只对**尚未遮蔽**的位置生效：新增一个 pin 不能让历史位置"复活"，否则边界回退、那段前缀全部失效。而加 pin 的动机恰恰是"我刚发现这个文件要 debug"，是高频操作。
+
+   > 单测：连续遮过 8 条之后，第 9 条在下一轮仍然能进区段。
+
+6. **`maxSpanPerTurn` 是安全阀**（默认 8 条）。一个长步骤收尾后可能一次性释放二十几条候选，全遮的话一次改动要重算整个步骤。分两三轮推进的代价是两次 `(w−c)×S`，但每次的 `S` 更小，且模型不会一次性失去二十几条证据。
 
 > 关于"步骤收尾才释放"本身的风险：`coverAfter` 信号就是为它准备的。不必等整个步骤 concluded——一条结果后面出现两条新结果，它就已经不是"当前事实"了。这是让 lag-1 保持 lag-1 的关键，否则 step 粒度一粗，机制就退化成 lag-k。
 
@@ -360,10 +399,10 @@ first lines:
 tail:
 >   } catch (err) { next(err); }
 > };
-[full content: recall("a1b2c3d4") · stored at session.jsonl@102400]
+[full content: recall("a1b2c3d4")]
 ```
 
-### 6.3 渲染的五条硬规则
+### 6.3 渲染的六条硬规则
 
 | 规则 | 说明 |
 |---|---|
@@ -372,6 +411,7 @@ tail:
 | **R3 数值一律整数** | `~12.5k tok` 由 `Math.round(tokens/100)/10` 得出，同一输入恒定 |
 | **R4 不用 LLM 生成** | 任何 LLM 参与都会引入不确定性。若必须用（如抽取 highlights），见 §6.4 |
 | **R5 措辞中性** | 不能写成 `ERROR: output missing`，模型会去重试。用 "moved out of context" |
+| **R6 不出存储路径**（v1.3） | 只给 `recall(entryId)`。v1.2 的样例里还带着 `stored at session.jsonl@102400`——那个路径在 `~/.pi/agent/` 下，模型的 `read` 以工作目录为根，写了它只会诱导模型去仓库里找一个不存在的文件（contract §3 规则 3）。字节偏移属于审计字段，留在 `masks.jsonl` 里 |
 
 ### 6.4 如果一定要用 LLM 抽取 highlights
 
@@ -383,6 +423,8 @@ tail:
 ---
 
 ## 7. 与 recall 的配合
+
+> **归属说明（v1.3）**：`recall` **不随 2B 发布**，它随 2A 一起上线（`interface-contract.md` §3.1）。2A 的 L2 落盘与阶段 1 的硬上限截断都需要它，而两者都排在 2B 之前。本文定义它的契约，是因为"遮蔽之后怎么取回"是 2B 最关心的问题，不是因为 2B 拥有它。
 
 ### 7.1 契约
 
@@ -412,16 +454,25 @@ recall 只在"需要复核证据"时有用，不是"恢复上下文"的手段。
 ```
 ~/.pi/agent/
   sessions/<project>/<session>.jsonl      # pi 的源真相，本机制只读，绝不写
-  state/<projectId>/                       # 本插件工作区（路径唯一定义见 interface-contract.md §3）
-    masks.jsonl                            # 冻结的遮蔽记录，只追加，一行一条
+  state/<projectId>/                       # 项目级（跨会话共享）
     blobs/<entryId>.<ext>                  # 不可重放输出的完整原文（持久目录，不是 tmp）
-    blobs/index.jsonl                      # entryId → {kind, bytes, sha, source, createdAt}
-    pins.json                              # 用户显式豁免列表
-    metrics.jsonl                          # 每轮 token/cache 估算，供评估用
-    offsets.json                           # 派生：entryId → {offset,len}，可随时删除重建
+    blobs/index.jsonl                      # 项目级索引；写入需项目级锁（见 §8.1）
+    facts/<sessionId>.jsonl                # harness 的事实日志（phase-3），仓库外
+    sessions/<sessionId>/                  # 会话级（v1.3 变更）
+      masks.jsonl                          # 冻结的遮蔽记录，只追加，一行一条
+      pins.json                            # 用户显式豁免列表
+      metrics.jsonl                        # 每轮 token/cache 估算，供评估用
+      offsets.json                         # 派生：entryId → {offset,len}，可删除重建
 ```
 
-> **v1.2 修正**：v1.1 写的是 `ctx/<sessionId>/`，phase-2 §4.5 写的是 `<sessionTmp>/blobs/`，两处都声称"同一份定义"。实际是两个不同路径，而且后者是临时目录——与 I5「被遮蔽的原文必须仍可取得」直接冲突。现统一到 `state/<projectId>/`，见 `interface-contract.md` §3。2A 的 L2 落盘与 2B 的原文落盘共用这一个目录与这一份索引。
+> **v1.3 修正**：v1.2 把 `masks.jsonl` / `pins.json` 放在项目级，与 `blobs/` 同级。那是错的——
+> - **pin 的语义是"在当前这条会话里我正在看什么"**。放到项目级，A 会话 pin 了 `auth.ts`，B 会话也读不到它，而用户从没在 B 里做过这个决定。
+> - **`masks.jsonl` 的键是 entryId，属于特定会话的 entry 树**。跨会话共享没有意义，撤销也说不清"撤的是谁的"。
+> - **`state/<projectId>` 只有一层，"同一 session 单写者"的纪律罩不住它**。两个会话并行跑同一个项目时，会同时追加同一个 jsonl，并共用同一份 pin。
+
+> `blobs/` 留在项目级是对的：`entryId` 全局唯一，跨会话天然不冲突，重复落盘也没必要。但 `index.jsonl` 是多写者的追加文件，必须有项目级锁（`flock` 或 `O_APPEND` + 单行原子写）。
+
+> 路径的唯一定义见 `interface-contract.md` §3。
 
 分层原则：
 
@@ -433,11 +484,16 @@ recall 只在"需要复核证据"时有用，不是"恢复上下文"的手段。
 | `offsets.json` | 派生索引 | 可丢，启动时重建 |
 | `metrics.jsonl` | 观测数据 | 可丢 |
 
-### 8.1 崩溃安全
+### 8.1 并发与崩溃安全
+
+| 层级 | 文件 | 写者纪律 |
+|---|---|---|
+| 会话级 | `masks.jsonl`、`pins.json`、`metrics.jsonl`、`offsets.json` | **单写者**：同一 session 同时只允许一个进程写，检测到并发则拒写并提示 |
+| 项目级 | `blobs/index.jsonl` | **多写者**：`O_APPEND` 单行原子写；读时丢弃残缺末行。**不能假设单写者**——两个会话会同时落盘 |
 
 - `masks.jsonl` 每次写入 fsync（一次会话里最多几百次写，成本可忽略）
+- `pins.json`：读发生在每轮组装，写用"临时文件 + rename"原子替换；写入前 fsync
 - 加载时若末行不完整（无结尾换行或 parse 失败），丢弃末行，不报错
-- 单写者纪律：同一 session 同时只允许一个进程写；检测到并发则拒写并提示
 
 ### 8.2 与 pi 内置 compaction 的关系
 
@@ -474,7 +530,7 @@ pi 的 session 是树，`/tree` 可在任意节点切分支，`/fork` 可复制�
 | `enabled` | `false` | bool | 总开关。默认关，需显式打开 |
 | `lagTurns` | `1` | 1–2 | 滞后轮数。1 为最小失效范围，不建议改大 |
 | `minTokens` | `1000` | 200–8000 | 绝对下限，小于此体量不遮蔽 |
-| `minRatioOverSuffix` | `4` | 1–20 | `M ≥ ratio × S` 才遮。**`4` 的真实含义是"回本 ≤ 1.5 轮"**（DeepSeek 口径，见 `interface-contract.md` §4），不是"≤ 4 轮"。调大可省缓存、调小可省 token |
+| `minRatioOverSuffix` | `1` | 0.5–20 | 整段门槛 `M_total ≥ ratio × S`（§5.3 约束 3）。`1` = "改动代价不超过这一刀的节省"；**不是回本判据**，回本由 `paybackOk` 决定。v1.3 由 4 下调 |
 | `maskBudgetTokens` | `160` | 80–400 | 单块渲染上限；多块 message 按 `160 + 40×(块数−1)` 计，硬上限 320 |
 | `headLines` / `tailLines` | `5` / `5` | 0–20 | 保留的原文行数 |
 | `highlightLimit` | `3` | 0–5 | 关键行上限 |
@@ -531,12 +587,14 @@ pi 的 session 是树，`/tree` 可在任意节点切分支，`/fork` 可复制�
 | `mask_savings` | Σ(M − m) 的累计值 | 越大越好 |
 | `mask_overhead` | Σ m / 总上下文 token | < 15% |
 | `payback_turns` | 每条遮蔽事件的 `n*`（§2.4） | ≤ 3 轮 |
-| `re_read_rate` | 同一 path 重复 read 次数 / 总 read | 绝对值 < 10% **且** 增幅 < 20%（两个都看，基线本身可能已 15%） |
+| `re_read_rate` | 同一 path 重复 read 次数 / 总 read | **只看相对增幅 < 20%**（对影子期基线）。绝对值 < 10% 仅当基线本身低于 10% 时并用；基线 15% 时它不可用，见下 |
 | `steps_per_task` | 完成任务的平均步数 | 增幅 < 5% |
 | `repeat_error_count` | 同一报错文本重复出现的次数 | 不上升 |
 | `use_opportunity_coverage` | 有任一 I4 信号凭据的 mask / 总 mask | = 100% |
 | `conclusion_coverage` | 有 `conclusionRef`（最强信号）的 mask / 总 mask | 仅观测，不设门槛 |
 | `task_success` / `diff_correctness` | 任务成功率、最终 diff 是否正确 | 不下降 |
+
+**`re_read_rate` 为什么不能设绝对门槛**（v1.3）：括号里已经承认"基线本身可能已 15%"，那 `< 10%` 就是一条**基线不满足的门槛**。基线 15% 的项目里，实验组完全不恶化（15% → 15%）也判不过，结论会被口径伪装成"2B 有害"。改为 `exp / baseline − 1 < 20%`。绝对水位降级为报告项——它回答"重读本身是否已经失控"，不回答"这次改动是否变差"。两件事混成一条门槛是 v1.2 的实际错误。
 
 ### 13.2 回放脚本（离线，不需调模型）
 
@@ -599,21 +657,39 @@ M0 必须先做。如果归因显示 token 主要花在"少数几次超大读取
 
 ## 16. 附录 A：一个六轮走查
 
-假设修复一个鉴权 bug，`minTokens = 1000`。
+假设修复一个鉴权 bug。`minTokens = 1000`、`minRatioOverSuffix = 1`、`coverAfter = 2`、`maxSpanPerTurn = 8`。
 
-| 轮 | 发生了什么 | 上下文中的 tool result 形态 |
-|---|---|---|
-| T1 | `read src/auth.ts`（12k tok） | R1 完整（12k） |
-| T2 | `read src/middleware.ts`（6k tok） | R1 完整、R2 完整 |
-| T3 | `grep -n "authorization"`（800 tok）<br>step1 收尾并写下结论 | R1 完整、R2 完整、R3 完整（R1 已 eligible 但**尚未**遮蔽——本轮组装时它还不是"落后"位置） |
-| T4 | 组装上下文：R1、R2 满足全部条件 → 一次遮蔽 | R1→mask(120tok)、R2→mask(110tok)、R3 完整、R4 完整 |
-| T5 | 模型需要确认 R1 里的一个分支条件，调用 `recall("R1id")` | 尾部追加一条召回消息（12k），**原位置不变** |
-| T6 | 下一轮组装：R3 满足条件 → 遮蔽 | R1 mask、R2 mask、R3 mask、R5 完整、尾部召回的 12k 保留（它是尾部消息，按同样规则以后再遮） |
+| 轮 | 发生 | 该轮组装时的判定 | 上下文形态 |
+|---|---|---|---|
+| T1 | `read auth.ts`（12k） | — | R1 完整 |
+| T2 组装 | | R1 之后无结果 → I1 不满足 | R1 完整 |
+| T2 | `read middleware.ts`（6k） | | R1、R2 完整 |
+| T3 组装 | | R1 后有 1 条，`coverAfter = 2` 未满足 | R1、R2 完整 |
+| T3 | `grep "authorization"`（800） | | R1、R2、R3 完整 |
+| T4 组装 | | R1 后有 R2、R3 两条 ✓。区段 `[R1]`：`M = 12000`，`S ≈ 7000`（R2+R3+assistant），`12000 ≥ 1×7000` ✓ → 遮蔽 | R1→mask(120)、R2、R3 完整 |
+| T4 | `read session.ts`（4k） | | R4 完整 |
+| T5 组装 | | R2 后有 R3、R4 ✓。区段 `[R2]`：`M = 6000`，`S ≈ 4800`，`6000 ≥ 4800` ✓ → 遮蔽 | R1 mask、R2→mask(110)、R3、R4 完整 |
+| T5 | `recall("R1")` | | 尾部追加召回（12k），**原位置不变** |
+| T6 组装 | | R3 之后只有 R4 一条（召回不是 tool result，不占位置），`coverAfter` 未满足 → 不遮 | 同上，召回保留在尾部 |
+| T6 | `edit auth.ts`（回执 300） | | 新增 R5，低于 `minTokens` |
 
 关键观察：
-- 每轮只推进一次边界，失效率可控
+
+- 每轮只推进一个区段，边界单调前进，失效率可控
 - 召回在尾部，前缀不变，缓存只失效尾部新增部分
-- T5 的 12k 会在 T7/T8 被同样遮蔽——召回不是"特权通道"
+- T5 的 12k 召回会在后续被同样遮蔽——召回不是"特权通道"
+- **R5 只有 300 token，被越过而不是挡住游标**（§5.3 约束 3）。这是 v1.1 最致命的缺陷：按"断开"读法，一条 edit 回执就会永久冻住整个机制
+
+**批量情形——v1.2 算错的地方**
+
+假设 T4 组装时 R1、R2 都满足 `coverAfter`，区段 = `[R1, R2]`（`M_total = 12000 + 6000 = 18000`、`m_total = 120 + 110 = 230`）。区段之后只剩 R3（800）：
+
+| | `S` 的取法 | `Δ`（DeepSeek，`c=0.1, w=1.0`） |
+|---|---|---|
+| 正确 | 区段**最后一条（R2）之后** + 空洞 = R3 ≈ 800 | `1·230 + 0.9·800 − 0.1·18000 = −850` → **立赚** |
+| v1.2 | `cachedTokensAfter(R1)` = R2 + R3 = 6800 | `230 + 0.9·6800 − 1800 = 4550` → **看起来大亏** |
+
+差值 `5400 = 0.9 × 6000` 正是 R2 的原文——它已经在 `M_total` 里被计过一次。**单条区段看不出这个错（区段只有一条时，`span[0]` 与 `span.last` 是同一个位置），批量才显形，而 `maxSpanPerTurn = 8` 存在的意义就是批量。**
 
 ## 17. 附录 B：单测清单（每条对应一个不变式）
 
@@ -627,13 +703,17 @@ M0 必须先做。如果归因显示 token 主要花在"少数几次超大读取
 8. 同一 message 内多个 tool_result 整体遮蔽，不拆分
 9. 分支 A 的遮蔽不影响分支 B 的 `computeEligible` 结果（I6）
 10. 末行残缺的 `masks.jsonl` 能正常加载
-11. 并发写检测：第二个写者被拒绝
+11. **并发写检测**：会话级文件（`masks.jsonl` / `pins.json`）第二个写者被拒绝；项目级 `blobs/index.jsonl` 允许并发追加且不丢行（§8.1）
 12. 关闭开关时，输出与未安装插件时逐字节一致（本机制不改工具集，见 `interface-contract.md` §2）
 13. **永久不合格项不阻塞游标**：构造"大结果 → pin 结果 → 大结果"的序列，第三次调用时后一个大结果仍被遮（v1.2）
 14. **暂时不合格项阻塞游标**：构造"大结果（无使用机会）→ 大结果（已覆盖）"的序列，第二条本轮不被遮（v1.2）
 15. **单轮条数上限**：`maxSpanPerTurn = 8` 时，一次性释放二十条候选，首轮只遮 8 条（v1.2）
-16. **区段空洞不额外计费**：区段中间夹一条 pin 时，`S` 与"无空洞"情形相同（v1.2）
-17. **新增 pin 不回退已遮位置**：对一个已 masked 的位置新增 pin，`assembleContext` 仍读冻结记录，边界不后退（v1.2，见 §5.3 约束 4）
+16. **区段空洞要计费**：区段中间夹一条 12k 的 pin 项时，`S` 包含它的 12000（进 `(w−c)` 项），不是 0（§5.3 约束 2）
+17. **新增 pin 不回退已遮位置**：对一个已 masked 的位置新增 pin，`assembleContext` 仍读冻结记录，边界不后退（v1.2，见 §5.3 约束 5）
+18. **`S` 不含区段内部被遮项**：区段 `[R1, R2]` 时 `S = cachedTokensAfter(R2) + holeM`，必须严格小于 `cachedTokensAfter(R1)`；两者相等说明退化成了 v1.2 的错法（§5.3 约束 1）
+19. **整段门槛与丢弃重试**：`M_total < ratio×S` 时整段不遮，且把最早项视为永久留下、从下一项重新组段；不得 `break`（§5.3 约束 3）
+20. **已冻结项不占名额**：连续遮过 8 条之后，第 9 条在下一轮仍能进区段（§5.3 约束 5）
+21. **pin 是左边界**：构造"12k 结果 → 8k pin → 12k 结果"，首轮区段可以跨过 pin 但要计 `holeM=8000`；当 `M < S` 被丢弃重试后，新区段的起点必须落到 pin 之后、`holeM` 归零（§5.3 约束 2、contract §4.4）
 
 ---
 
@@ -676,3 +756,18 @@ M0 必须先做。如果归因显示 token 主要花在"少数几次超大读取
 | **已冻结的遮蔽不受 pin 影响**（§5、§5.3 约束 4、§10） | 状态机写"pinned 可从任一状态进入" | 新增一个 pin 会让已遮蔽的历史位置"复活"，边界回退、整段前缀失效——而加 pin 的动机（"这个文件要 debug"）恰恰是高频操作。也与 I3「masked 是终态、不可逆」直接矛盾 |
 
 **I1、I2、I3、I5、I6 未改动。** 只有 I4 的判据被替换。
+
+**v1.3 · 2026-11-02**
+
+| 改动 | 原内容 | 原因 |
+|---|---|---|
+| **`S` 改为"区段最后一条之后 + 区段内空洞"**（§5.3 约束 1、§16） | `cachedTokensAfter(span[0])`，即"第一条之后" | 区段里第 2 条到最后一条既在 `M_total` 里、又在 `S` 里，被算了两次。两条各 12k 时 `Δ` 从 **−2080（立赚）** 变成 **+8720（大亏）**，多出来的正是 `(w−c)` 乘其余区段原文。`maxSpanPerTurn=8` 让批量成为常态，而批量正是误价最严重的情形 |
+| **区段空洞改为计费**（§5.3 约束 2、§17 16） | "跳过中间某一条不产生额外缓存代价" | 相对"不遮"，空洞项随改动点一起重算、原文却不变小，确实进入 `(w−c)` 项。原说法只在"已决定遮 `span[0]`"的前提下成立，是自欺。顺带纠正续写的另一句错话：v1.2 说"把大 pin 当右边界断开可能更划算"——那是三种做法里最差的一种（把 pin 自己算进了 `S`），正确方向是把 pin 当**左**边界（contract §4.4、§17 21） |
+| **`minRatioOverSuffix` 真正进算法，且按整段判**（§5.3、约束 3、§17 19） | §5.1 写了触发条件，循环里只判了 `minTokens` | 门槛根本没实现。而且不能逐条判——第一条的 `S` 会含同区段其余原文，`M < 4S` 几乎必然成立，批量遮蔽被自己的门槛关掉。不达标时丢弃最早项重试、**不许 break**：`S` 只增不减，挡游标等于死锁 |
+| **默认值 `4 → 1`**（§5.1、§10） | `4×S` | `4` 的语义从来没对上：注释说"回本 ≤ 4 轮"，重算实际是 1.3–1.5 轮，而 1.3 轮的回本要求会把 `M=12k / S=7k`（4.4 轮回本、明显划算）也拒掉。门槛只该筛掉 `M < S`，经济决策归 `paybackOk` |
+| **`masks.jsonl` / `pins.json` 回会话级**（§8、§8.1） | 放在项目级 | pin 的语义是"当前这条会话里我在看什么"，跨会话共享会让 A 的 pin 影响 B；masks 的 entryId 属于特定 entry 树；且"单 session 单写者"的纪律罩不住项目级目录。`blobs/` 留项目级（entryId 全局唯一），索引加项目级锁 |
+| **`frozen` 检查提前，且不占名额**（§5.3 约束 5、§17 20） | 扫描从最前面开始，没有 frozen 跳过 | 已遮过的大结果每轮重新入选，按原始 `M` 占满 8 个名额，后面的新结果永远轮不到；而若拿遮蔽后的 160 token 去比 `minTokens`，把阈值调到 160 以下它们又回来 |
+| 附录 A 按新规则重写（§16） | 旧的"步骤收尾再一起遮" | 没有 `coverAfter`、没有比率门槛、没有算例。实现者会把它当规范 |
+| **渲染文本去掉存储路径**（§6.2、§6.3 R6） | `[full content: recall("a1b2c3d4") · stored at session.jsonl@102400]` | `session.jsonl` 与 blob 都在 `~/.pi/agent/` 下，模型的 `read` 以工作目录为根。给了它读不到的路径，等于让它猜或者乱读。字节偏移留在 `masks.jsonl` 里做审计 |
+| **`re_read_rate` 去掉绝对门槛**（§13.1） | "绝对值 < 10% 且增幅 < 20%" | 括号自己承认基线可能是 15%，那 `< 10%` 就是一条基线本身不满足的门槛。基线 15% 的项目里不恶化也判不过。改为只看相对增幅，绝对水位降级为报告项 |
+| **`recall` 改为随 2A 上线**（§7 归属说明） | 本文默认 `recall` 是 2B 的工具 | 2A 的 L2 指针与阶段 1 的硬上限截断都要用它，两者都在 2B 之前。若随 2B 发布，前两阶段会渲染出指向不存在工具的指针 |
