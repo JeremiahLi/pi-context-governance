@@ -42,7 +42,7 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 </div>
 
 <div class="warn">
-<strong>v1.3 修的是 v1.2 自己引入的四处错。</strong>① 2B 的区段代价 <code>S</code> 从"区段第一条之后"改成"区段最后一条之后 + 区段内空洞"，否则被遮蔽的内容会被算两次，<code>Δ</code> 方向翻转（两条各 12k 时从 −2080 变成 +8720）；② <code>minRatioOverSuffix</code> 由 4 改为 1，因为"回本 ≤1.5 轮"会把 5.2 轮回本的明显划算案拒掉；③ <code>interface-contract</code> §6 把刚拆掉的硬前置（"阶段 3 必须先于 2B"）写了回去，与 lag1 §4.1 直接冲突；④ 脱敏被扩到了 <code>read</code>/<code>grep</code> 的源码正文上，会撞坏 <code>edit</code> 的 <code>oldText</code> 匹配。另有写保护只覆盖了 <code>.pi/state/</code> 一个根、<code>re_read_rate</code> 的绝对门槛在基线 15% 时永不可过两处。⑤ <code>recall</code> 一直被当作 2B 的工具描述，但 2A 的 L2 指针与阶段 1 的硬上限截断已经在用它——那两个阶段上线时会渲染出一个调不通的工具名。现在明确 <code>recall</code> 随 2A 上线。
+<strong>v1.3 修的是 v1.2 自己引入的四处错。</strong>① 2B 的区段代价 <code>S</code> 从"区段第一条之后"改成"区段最后一条之后 + 区段内空洞"，否则被遮蔽的内容会被算两次，<code>Δ</code> 方向翻转（两条各 12k 时从 −2080 变成 +8720）；② <code>minRatioOverSuffix</code> 由 4 改为 1，因为"回本 ≤1.5 轮"会把 4.4 轮回本的明显划算案拒掉；③ <code>interface-contract</code> §6 把刚拆掉的硬前置（"阶段 3 必须先于 2B"）写了回去，与 lag1 §4.1 直接冲突；④ 脱敏被扩到了 <code>read</code>/<code>grep</code> 的源码正文上，会撞坏 <code>edit</code> 的 <code>oldText</code> 匹配。另有写保护只覆盖了 <code>.pi/state/</code> 一个根、<code>re_read_rate</code> 的绝对门槛在基线 15% 时永不可过两处。⑤ <code>recall</code> 一直被当作 2B 的工具描述，但 2A 的 L2 指针与阶段 1 的硬上限截断已经在用它——那两个阶段上线时会渲染出一个调不通的工具名。现在明确 <code>recall</code> 随 2A 上线。
 </div>
 
 
