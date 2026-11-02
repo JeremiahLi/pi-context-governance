@@ -106,6 +106,7 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 <tr><td>按重要性挑着削减/遮蔽</td><td>破坏前缀缓存的 FIFO 性质，代价高一个数量级（见 §5.3）</td></tr>
 <tr><td>二次合并（把多条记录合成一条）</td><td>合并发生在老位置，等于全量缓存失效；且破坏"一次冻结"</td></tr>
 <tr><td>跨会话的语义检索</td><td>另一个问题，需要另一套存储；混进来会让本插件失焦</td></tr>
+<tr><td>按 Agent 类型或流程阶段切换策略</td><td>新增能力只指向"更早地少给信息"，与零容忍相悖；70 个键过筛后只剩 1 个维度真该随阶段变，不值一套 schema + 状态机 + 推断调用。这类知识属于 agent 自己，不属于插件</td></tr>
 <tr><td>修改 pi 的 session JSONL</td><td>源真相只读。任何写入都会让审计与回放失效</td></tr>
 <tr><td>让模型自己维护状态</td><td>不确定、每轮花 token、会漂移。状态必须按来源分权（§6.2）</td></tr>
 </table>
