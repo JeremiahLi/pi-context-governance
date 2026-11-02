@@ -34,7 +34,12 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 
 <h1>pi 上下文治理插件 · 总体设计说明</h1>
 <p class="sub">阶段 0–4 全景：框架、原理、能力边界与取舍</p>
-<p class="meta">v1.1 · 2026-11-02 · 配套文档：<code>phase-0</code> ~ <code>phase-3</code>、<code>lag1-masking-design</code>、<code>pi-context-compression-prd-v0.1</code></p>
+<p class="meta">v1.2 · 2026-11-02 · 配套文档：<code>phase-0</code> ~ <code>phase-3</code>、<code>lag1-masking-design</code>、<code>interface-contract</code>（共享常量与断言的唯一来源）、<code>pi-context-compression-prd-v0.1</code></p>
+
+<div class="warn">
+<strong>v1.2 不是加功能，是修接口。</strong>跨文档的共享常量、断言、路径已收敛到 <code>interface-contract.md</code>。此前 v1.1 至少有六处"单份文档内部看着对、接口上加起来错"的矛盾：<code>A7</code> 降级了但阶段 1 的 bash 软上限没跟；<code>§6</code> 改成"边际收益不为零"但 <code>reducedBy</code> 规则仍让 2B 跳过一切被 2A 碰过的消息；总览说注入块不随轮数增长而阶段 3 自己承认 50 轮会到 25k；blob 有两个路径且其中之一在临时目录；"全关逐字节一致"被当成全局不变量；2B 的游标判定按两种读法实现都会失败。<br>
+改动细节见各文档的「v1.2 · 2026-11-02」修订记录，判据与常量的唯一版本见 <code>interface-contract.md</code>。
+</div>
 
 
 <div class="toc">
@@ -109,7 +114,7 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 
 <h2 id="s2">2 · 全景架构</h2>
 
-<p>整个插件活在"消息组装"这一层：pi 从 session 树里取出可见消息之后、送给模型之前。所有机制都是这条链上的一个函数，全部可独立开关；全关时输出与原生逐字节一致。</p>
+<p>整个插件活在"消息组装"这一层：pi 从 session 树里取出可见消息之后、送给模型之前。所有机制都是这条链上的一个函数，全部可独立开关；<strong>在不改工具集的机制上（0 / 2A / 2B / 3）</strong>，全关时输出与原生逐字节一致。阶段 1 一旦注册自己的 <code>read</code>，请求里的工具定义就变了、前缀随之改变，那条断言在那里不成立——它的基线只能是"插件未加载 + 重启进程"。</p>
 
 <div class="fig">
 <svg viewBox="0 0 880 400" width="100%" role="img">
@@ -243,7 +248,7 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 </div>
 
 <h3>3.4 验收</h3>
-<p>≥3 个真实会话跑通；有 <code>usage</code> 的会话 MAPE ≤ 15%；报告必须能直接回答四个问题（工具占比、top5 消耗源、是否值得遮蔽、缓存是否在抖）；只读断言（输入文件 sha256 前后一致）；同一输入两次运行输出逐字节相同。</p>
+<p>≥3 个真实会话跑通；有 <code>usage</code> 的会话 <code>mape_holdout</code> ≤ 25%（前 80% 轮拟合、后 20% 轮预测的误差，不是全量拟合误差）；报告必须能直接回答四个问题（工具占比、top5 消耗源、是否值得遮蔽、缓存是否在抖）；只读断言分两种情形——已关闭会话校验全文 sha256，活跃会话只校验已读前缀并标注 <code>live</code>；同一输入两次运行输出逐字节相同。</p>
 
 <h2 id="s4">4 · 阶段 1 · 读取纪律</h2>
 
@@ -289,8 +294,8 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 <table>
 <tr><th style="width:110px">工具</th><th>契约要点</th></tr>
 <tr><td><code>read</code></td><td>三分支（≤1500 行全文 / 1500–20000 大纲 / &gt;20000 只给大纲）；首行带规模头 <code>842 lines · 24 symbols · sha</code>；行号前缀 <code>123| </code>（需明确声明不要复制进 edit 的 oldText）；同 path+sha+range 在 5 轮内重复则只回一句提示；生成文件/二进制/minified 直接拒读</td></tr>
-<tr><td><code>grep</code></td><td>命中 ≤15 条或估算 &lt;2k token 时直接返行；否则返聚合计数（每文件命中数）。展开时 <code>context=2</code>，命中文件数 &gt; 20 只回 top 20</td></tr>
-<tr><td><code>bash</code></td><td>软上限 200 行/8KB → head 80 + tail 40 + 落盘；硬上限 2000 行/200KB</td></tr>
+<tr><td><code>grep</code></td><td>展开结果估算 ≤ 2k token <strong>且</strong>条数 ≤ 50 时直接返行；否则返聚合计数（每文件命中数）。展开时 <code>context=2</code>，命中文件数 &gt; 20 只回 top 20</td></tr>
+<tr><td><code>bash</code></td><td><strong>不做日常截断</strong>：原样返回，只有超过 <code>a7.hardCapTokens</code>（20k token）才 head + tail + 中部扫描 + 落盘</td></tr>
 <tr><td><code>ls</code>/<code>glob</code></td><td>默认只列一层；条目 &gt; 50 折叠；始终忽略 <code>node_modules</code>/<code>dist</code> 等</td></tr>
 <tr><td><code>edit</code>/<code>write</code></td><td>只回 changed hunks 与统计，<strong>不自动回读</strong>（回读是最常见的双倍开支）</td></tr>
 </table>
@@ -319,6 +324,7 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 
 <h3>5.2 2A 的八条规则</h3>
 <p>ANSI 剥离、<code>\r</code> 覆写折叠、连续重复行折叠、空行压缩、行尾空白、超长单行截断、总量截断、非 UTF-8 容错。可逆性分三级：<strong>L0</strong> 纯表示层、<strong>L1</strong> 冗余消除、<strong>L2</strong> 有信息丢失。<strong>L2 必须先落盘成功，落盘失败则放弃变换、返回原文</strong>——宁可变大，不可丢数据。</p>
+<p><strong>作用域是硬约束，不是建议：</strong>除 ANSI 剥离、非 UTF-8 容错与脱敏外，其余规则<strong>只作用于命令输出</strong>，不碰 <code>read</code>/<code>grep</code> 的源码正文。<code>read</code> 返回的是可被 <code>edit</code> 原样回写的文本——删行尾空白会让 <code>oldText</code> 匹配失败，压空行会让行号与磁盘错位，而在 Windows 的 CRLF 源码上，<code>\r</code> 覆写折叠会把<strong>每一行清空</strong>。</p>
 
 <p>最关键的一条补充是<strong>中部扫描</strong>：head/tail 截断必然切掉中间，而报错常在中间。截断时对丢弃的中段做一次错误行正则扫描，命中的最多 20 行插回。不做它，你的截断会真的丢掉那行 <code>connection refused</code>，然后模型开始瞎猜。</p>
 
@@ -329,7 +335,7 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 <tr><th style="width:150px">约束</th><th>内容</th></tr>
 <tr><td>一次冻结</td><td>同一位置只写一次，渲染必须确定性（无时间戳、无随机量、不用 LLM），否则每轮文本微变，缓存全废</td></tr>
 <tr><td>严格 FIFO</td><td>边界只前进。淘汰回退、按重要性跳选、"补一刀"，全部按整段计费</td></tr>
-<tr><td>结论先行</td><td>没有结论引用该证据时不得遮蔽，否则证据在使用之前就消失了</td></tr>
+<tr><td>使用机会覆盖</td><td>证据必须已获得使用机会才可移出：被某条 decision 引用、或所属步骤已收尾、或其后已出现 ≥2 条新结果（三信号任一）。只看"有没有被结论点名"会让机制在第 3–5 轮永久停摆</td></tr>
 <tr><td>移出 ≠ 删除</td><td>原文必须仍可取得（JSONL 偏移或 blob），召回只能追加在尾部、不能回填</td></tr>
 <tr><td>决策与渲染分离</td><td>哪些位置该遮由纯函数 <code>f(path, config)</code> 决定（天然支持分支与崩溃恢复），遮什么由一次性冻结决定（保证确定性与缓存友好）</td></tr>
 </table>
@@ -363,7 +369,7 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 </div>
 
 <div class="warn">
-<strong>判据（v1.1 修正）：</strong><code>c·(M−m)·(R−t) &gt; w·m + (w−c)·S</code>，即"剩余轮数的累计节省"要大于"这一刀的一次性代价"。按对 2B 最不利的 <code>M=2k, m=160, S=2k</code> 代入：DeepSeek 需剩余 &gt;11 轮，OpenAI 需剩余 &gt;2 轮；<code>M=12k</code> 时 DeepSeek 只需 &gt;2 轮。<strong>决策变量是会话还剩多少轮，不是 2A 有多强。</strong>「削减幂等性」仍然保留：被 2A 削减过的消息打标记，2B 不重复削，<code>double_reduced_count</code> 必须为 0。
+<strong>判据（v1.2）：</strong><code>c·(M−m)·(R−t) &gt; w·m + (w−c)·S</code>，即"剩余轮数的累计节省"要大于"这一刀的一次性代价"。按对 2B 最不利的 <code>M=2k, m=160, S=2k</code> 代入：DeepSeek 需剩余 &gt;11 轮，OpenAI 需剩余 &gt;2 轮；<code>M=12k</code> 时 DeepSeek 只需 &gt;2 轮。<strong>决策变量是会话还剩多少轮，不是 2A 有多强。</strong>「削减幂等性」修正为：只有 <strong>L2</strong>（有损削减）不重复，且 2B 遮蔽时复用已有的 blob；L0/L1 不阻止 2B。<code>double_reduced_count</code> 指"同一原始内容存在两个 L2 blob"，必须为 0。
 </div>
 
 <h2 id="s6">6 · 阶段 3 · 状态外部化</h2>
@@ -399,7 +405,7 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 
 <rect x="40" y="150" width="800" height="70" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
 <text x="440" y="176" text-anchor="middle" font-size="13" font-weight="600" fill="#085041">.pi/state/</text>
-<text x="440" y="200" text-anchor="middle" font-size="11.5" fill="#0F6E56">plan.md · decisions.md · constraints.md · facts/&lt;session&gt;.jsonl · handoff.md</text>
+<text x="440" y="200" text-anchor="middle" font-size="11.5" fill="#0F6E56">plan.md · decisions.md · constraints.md · handoff.md　（facts/ 在仓库外）</text>
 
 <line x1="440" y1="222" x2="440" y2="266" stroke="#8A8880" stroke-width="1.5" marker-end="url(#c)"/>
 <text x="456" y="248" font-size="11" fill="#8A8880">只取活跃集</text>
@@ -407,7 +413,7 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 <rect x="260" y="270" width="360" height="54" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
 <text x="440" y="302" text-anchor="middle" font-size="13" font-weight="600" fill="#085041">尾部注入块 · 约 500 token</text>
 
-<text x="40" y="356" font-size="12" fill="#5F5E5A">恒定大小，只出现在上下文尾部 —— 不随轮数增长，不破坏前缀缓存。</text>
+<text x="40" y="356" font-size="12" fill="#5F5E5A">恒定大小，只在本次请求尾部临时拼接、不写入历史 —— 因而不随轮数增长。</text>
 </svg>
 <p class="cap">图 5 · 三个写者、各写各的文件、只有一个消费口。</p>
 </div>
@@ -415,13 +421,15 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 <h3>6.2 核心机制（三条）</h3>
 <table>
 <tr><th style="width:150px">机制</th><th>内容</th><th style="width:180px">解决什么</th></tr>
-<tr><td><strong>按来源分权</strong></td><td>事实由 harness 写（只追加，模型只读）；判断由模型写（必须引用 fact id）；约束只有人能生效（模型越权写入被丢弃并计数）。三者物理分离到不同文件</td><td>判断不会被当成事实继承</td></tr>
-<tr><td><strong><code>done_when</code></strong></td><td>计划条目由模型写，但 <code>status</code> 由 harness 对可验证条件求值（<code>cmd_exit0</code> / <code>test</code> / <code>file_contains</code> / <code>git_clean</code>），模型不能改</td><td>消灭"宣布完成"的虚报倾向</td></tr>
+<tr><td><strong>按来源分权</strong></td><td>事实由 harness 写（只追加、放仓库外，模型只读）；判断由模型写（必须引用 fact id）；约束只有人能生效。三者物理分离到不同文件，越权写入由 <code>edit</code>/<code>write</code> 入口的路径守卫拦截并计数</td><td>判断不会被当成事实继承</td></tr>
+<tr><td><strong><code>done_when</code></strong></td><td>计划条目由模型写；<code>done_when</code> 由模型<strong>提议</strong>，经静态检查（拒绝 <code>file_exists</code> / <code>true</code> 这类平凡谓词）与人确认后生效；<code>status</code> 由 harness 求值，模型不能改</td><td>消灭"宣布完成"的虚报倾向</td></tr>
 <tr><td><strong>可推翻条件</strong></td><td>每条 decision 必须写：引用、被否决的备选与原因、可推翻条件</td><td>结论不会变成不可质疑的教条</td></tr>
 </table>
 
 <h3>6.3 为什么"注入块恒定"是硬要求</h3>
-<p>如果注入块随轮数增长，它自己就成了新的膨胀源——Letta 的 memory block 就是这么烂掉的（没人修剪，涨到 8k token 每轮付费）。所以只注入活跃集：当前+下一步、全部生效约束、最近 3 条事实、未决判断、最多 3 条过期警告。验收要求 <code>inject_tokens</code> 的 P95/P50 &lt; 1.3。</p>
+<p>如果注入块随轮数增长，它自己就成了新的膨胀源——Letta 的 memory block 就是这么烂掉的（没人修剪，涨到 8k token 每轮付费）。所以只注入活跃集：当前+下一步、全部生效约束、最近 3 条事实、未决判断、最多 3 条过期警告。</p>
+<p><strong>但只压大小不够——块本身不能留在历史里。</strong>每轮追加一块、旧的从不回收，50 轮就是 25k。所以注入块<strong>不写入 session</strong>，只在本次请求的尾部临时拼接、发完即弃：历史里从来没有它，也就不存在回收问题。这也是为什么它不依赖 2B 回收（2B 默认关闭，且排在阶段 3 之后）。验收要求单块 <code>inject_tokens</code> 的 P95/P50 &lt; 1.3，且 <code>inject_tokens_total</code> ≈ 单块、<code>inject_persisted = 0</code>。</p>
+<p><strong>约束不按新旧截断。</strong>早期版本写"最多 10 条、超了按时间倒序截断"——那会让最早写下的常驻禁令（例如不许动 <code>migrations/</code>）第一个从模型眼前消失，而 <code>constraint_violation = 0</code> 随之失去意义。改为按人标注的优先级降级渲染（P0 全文 / P1 摘要 / P2 只计数），未标注的一律按 P0。</p>
 
 <h3>6.4 唯一真正的验收：冷启动</h3>
 <p>任务做到 60% 杀掉进程，新会话<strong>只加载 <code>.pi/state/</code>、不给任何对话历史</strong>，看能否继续做完，成功率 ≥ 80%。在这条通过之前，前面所有实现都只算"写了一堆文件"。</p>
@@ -520,14 +528,22 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 <text x="782" y="160" text-anchor="middle" font-size="10.5" fill="#5F5E5A">最后</text>
 
 <text x="26" y="206" font-size="11.5" fill="#5F5E5A">排序依据是质量风险，不是省 token 的多少：先做不改变"模型看到什么"的机制。</text>
-<text x="26" y="228" font-size="11.5" fill="#5F5E5A">两个 go/no-go：① Day 0 平台探针（能否改写历史消息 → 决定 2B；能否尾部注入并移除 → 决定阶段 3）；</text>
+<text x="26" y="228" font-size="11.5" fill="#5F5E5A">两个 go/no-go：① Day 0 探针（能否改历史消息 → 2B；能否只拼请求、不写 session → 阶段 3）；</text>
 <text x="26" y="250" font-size="11.5" fill="#5F5E5A">② 阶段 3 之后按不等式判 2B —— 判据是"会话还剩多少轮"，不是"2A 有多强"。</text>
 </svg>
 <p class="cap">图 7 · 顺序按质量风险排。2B 与阶段 1 的视图改动画成虚线，两者都取决于实测数据，不取决于计划。</p>
 </div>
 
 <div class="bad">
-<strong>整套方案有一个共同的技术前提尚未验证：</strong>pi 的扩展能否注册/覆盖工具、能否在组装层改写消息历史、能否在尾部注入并移除上一轮注入块。<strong>这三件事决定哪些机制存在</strong>——改写历史是 2B 的前提，尾部注入与移除是阶段 3 的前提。<strong>验证只要半天，必须排在所有实现之前（Day 0）。</strong>
+<p><strong>整套方案有一个共同的技术前提尚未验证。</strong>Day 0 的探针要回答四件事，每一件都直接决定某个机制是否存在：</p>
+<table>
+<tr><th style="width:44%">探针</th><th style="width:24%">决定什么</th><th>失败退路</th></tr>
+<tr><td>能否注册 / 覆盖原生工具</td><td>阶段 1 全部</td><td>退化为提示词方案（收益大打折扣），或直接跳过阶段 1</td></tr>
+<tr><td>能否在组装层改写历史消息</td><td>2B 全部</td><td>2B 不做</td></tr>
+<tr><td>能否<strong>只在请求尾部拼接、不回写 session</strong></td><td>阶段 3 的注入块</td><td>退化为"写入 + 按 lag-1 遮蔽"，但此时<strong>必须同时开 2B</strong>，否则 500 token/轮线性增长</td></tr>
+<tr><td>系统提示是否进 session</td><td>阶段 0 的前缀抖动检测</td><td>只能对比"第一轮注入内容"，检测能力大幅下降</td></tr>
+</table>
+<p><strong>第三条有连锁后果，不能当实现细节。</strong>如果"只拼请求"不可行，阶段 3 与 2B 就互相牵连——2B 没上线时阶段 3 就在泄漏，而 2B 默认关闭、排在阶段 3 之后。这正是 v1.1 的状态：它把"能否在尾部注入并移除上一轮注入块"列为前提，却又设计了一个不依赖移除、依赖 2B 回收的方案，而那个回收者还不存在。<strong>验证只要半天，必须排在所有实现之前（Day 0）。</strong></p>
 </div>
 
 <h2 id="s9">9 · 收益构成与代价</h2>

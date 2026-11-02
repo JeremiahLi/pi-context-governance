@@ -105,23 +105,26 @@ est(text) = ceil(cjk_count / 1.6 + other_count / 3.8) + 4
 - `other_count`：其余字符（代码与英文约 3.6–4.0 字符/token）
 - `+4`：每条消息的固定开销（role 标记、分隔符）
 
-**第二步：用真实 usage 校准**
+**第二步：用真实 `usage` 校准，且必须区分"拟合误差"和"预测误差"**
 
-对有 `usage` 的轮次做最小二乘拟合：
+对有 `usage` 的轮次拟合：
 
 ```
 input_tokens_i ≈ k · est(messages_i) + b
 ```
 
-报告 `k`、`b`、以及 **MAPE（平均绝对百分比误差）**。
+**只报全量拟合的 MAPE 没有意义**：`usage` 完整时 §3.1 允许直接用真实值，那么 `mape_insample` 衡量的是"拟合曲线贴不贴已经在手上的数据"，不是"对没有 `usage` 的轮次估得准不准"。而遮蔽模拟恰恰要对**未来轮次**估算——那才是这个校准系数唯一的用途。
 
-| MAPE | 判定 |
-|---|---|
-| ≤ 15% | 可用于绝对金额估算 |
-| 15%–30% | 只可用于相对比较（谁比谁大） |
-| > 30% | 报告首行标注"估算不可信"，只输出占比不输出金额 |
+所以按时间切分：
 
-**允许的取巧**：若同一会话里模型未变且 usage 完整，直接对每一步用 `usage` 的真实值，估算只用于"新建的、还没有 usage 的"部分（遮蔽模拟需要）。
+| 指标 | 算法 | 用途 | 门槛 |
+|---|---|---|---|
+| `mape_holdout` | 前 80% 轮拟合 `k,b`，在后 20% 轮上预测并算 MAPE | **真实预测能力**，遮蔽模拟的可靠性依据 | **≤ 25%** |
+| `mape_insample` | 全量拟合的 MAPE | 仅作报告参考，不设门槛 | — |
+
+为什么门槛是 25% 而不是 15%：分桶估算（CJK 1.6 字/token、其余 3.8 字符/token）对代码与中文混排的实际留出误差通常在 15–25%。设 15% 会让阶段 0 在样本少时被自己的噪声卡住——而 25% 已经足够支撑"相对比较"级别的全部决策（谁比谁大、占比多少）。超过 25% 时报告首行标注"估算不可信"，只输出占比、不输出金额。
+
+**关于"直接用真实值"**：有完整 `usage` 时成本账当然用真实值，但 `mape_holdout` 仍必须用估算器在留出轮次上跑一遍。否则你无法回答"遮蔽模拟对未来轮次的估算靠不靠谱"——而那是它唯一的用途。
 
 ### 3.2 缓存字段
 
@@ -179,16 +182,22 @@ input_tokens, cache_read_input_tokens, cache_creation_input_tokens, output_token
   "growth": { "slopePerTurn": 2650, "r2": 0.94 },
   "cache": { "readRatio": 0.89, "instabilityEvents": 3 },
   "repeatErrors": 2,
-  "estError": { "mape": 0.11, "k": 1.06, "b": 12 }
+  "estError": { "mapeHoldout": 0.19, "mapeInsample": 0.11, "k": 1.06, "b": 12 }
 }
 
-// SimEvent：遮蔽模拟的单次事件
+// SimEvent：**一轮一条**，对应一个会推进的区段（不是一条消息一条）
 {
-  "atTurn": 9, "entryId": "...", "tool": "read",
+  "atTurn": 9,
+  "span": ["e_1a2", "e_1a5", "e_1a7"],  // 含空洞的区段，中间可夹 pin/小额项
+  "tools": ["read", "grep"],
   "provider": "deepseek",
-  "M": 12480, "m": 160, "S": 2240,
-  "delta": 928, "paybackTurns": 0.75,
-  "wouldMask": true, "skipReason": null
+  "M": 12480,            // 区段内 ΣM
+  "m": 280,              // 区段内 Σm
+  "S": 2240,             // 只算一次：span[0] 之后、上一轮已进入缓存的部分
+  "delta": 928,
+  "paybackTurns": 0.75,
+  "caliber": "actual",   // actual（I4 三信号）| strict（只认 conclusionRef）
+  "paybackOk": true
 }
 ```
 
@@ -276,36 +285,53 @@ input_tokens, cache_read_input_tokens, cache_creation_input_tokens, output_token
 
 这是阶段 0 最有价值的输出：在没有一行产品代码的情况下，算出阶段 2 到底赚不赚。
 
-**算法（逐轮递推，不是静态公式）**：
+**算法（逐轮递推，且必须复用实现的判定函数）**：
 
 ```
 state: maskedIds = {}, effective[t]
 for t in turns:
-    # 1) 先按 lag-1 规则找 eligible（与实现同一套判定）
-    for msg in context(t):
-        if not isToolResult(msg): continue
-        if !lagSatisfied(msg, t): continue          # I1
-        if !concluded(msg): continue                # I4（阶段 0 可先按"下一轮即视为收尾"近似）
-        M = tokens(msg); m = estimateMaskTokens(msg)
-        S = cachedTokensAfter(msg, context(t))   # 只算上一轮已进入缓存的部分，不含本轮新增
-        if M < max(minTokens, ratio * S): continue
-        Δ = w*m + (w - c)*S - c*M                # c/w 取自 §3.2 的 provider 表
-        n = max(0, Δ) / (c*(M - m))
-        paybackOk = c*(M - m)*(R - t) > w*m + (w - c)*S   # 会话级判据，R 见 §6.2
-        emit SimEvent(...)
-        maskedIds.add(msg.id)
+    # 1) 取"本轮会推进的区段"——直接调用 lag1 §5.3 的 computeEligible，不另写一套筛选
+    span = computeEligible(context(t), config)      # 同一函数、同一 config、同一 minTokens/ratio
+    if span 非空:
+        M_total = Σ tokens(i)            for i in span
+        m_total = Σ estimateMaskTokens(i) for i in span
+        S = cachedTokensAfter(span[0], context(t))  # 只算一次：代价由最早的改动点决定
+        Δ = w*m_total + (w - c)*S - c*M_total       # c/w 取自 §3.2 的 provider 表
+        n = max(0, Δ) / (c*(M_total - m_total))
+        paybackOk = c*(M_total - m_total)*(R - t) > w*m_total + (w - c)*S
+        emit SimEvent(atTurn=t, span=[...], M=M_total, S=S, Δ=Δ, n=n, paybackOk=paybackOk)
+        maskedIds |= set(span)
     # 2) 计算本轮 effective（被遮蔽的用 m 替代）
     effective[t] = sum(m if id in maskedIds else tokens(...))
 ```
+
+**这一版与 v1.1 的两处差别都是硬要求**：
+
+| v1.1 的做法 | 后果 | v1.2 |
+|---|---|---|
+| 对同一轮里每条消息**各算一次** `Δ`，各自取自己的 `S` | 多条一起遮时，真实代价只有最早那个改动点的一次前缀失效，模拟把重叠的 `S` 加了多次 → **系统性高估代价** | 一轮一个区段、一个 `S`、一个 `Δ` |
+| `concluded` 近似为"下一轮即视为收尾" | 真实实现要求 I4 三信号，多数结果要等更久 → **系统性高估覆盖速度** | 用真实的 `hasUseOpportunity`，输出 strict / actual 两口径 |
+
+**两口径夹逼**（必须同时输出，不允许只给一个数）：
+
+- `strict` 口径：I4 只认 `conclusionRef`（即"必须被 decision 点名"）→ 给出**收益下界**
+- `actual` 口径：I4 三信号任一 → 给出**上线预期**
+
+两口径的差值本身就是信息：**差得越多，说明阶段 3 的 decision 覆盖越不足，2B 的收益越依赖 `coverAfter` 这条弱信号**。此时不应该调 2B 的参数，应该回去加强 `requireDecisionPerStep`。
 
 三个必须一起输出的东西：
 
 1. **收益曲线**：`effective_original[t]` vs `effective_masked[t]`，以及累计省下的 token
 2. **敏感性分析**：把"假设在 t-5 / t-10 轮前遮蔽"的 `Δ` 也算一遍，直接展示 FIFO 违规的代价陡增（这是设计文档 §2.4 那张回本表的实测版）
 
-3. **判据占比**：按 §2.4 的会话级不等式逐条判定 `paybackOk`，输出"满足条件的条目 / 总候选条目"。**这是 2B 做不做的唯一依据**：≥ 50% 建议开启；低于 50% 延后，但不"预期不做"——原方案把这件事写成了定性预期，在 OpenAI 上方向是错的。
+3. **判据占比**：按 §2.4 的会话级不等式逐条判定 `paybackOk`，输出"满足条件的区段 / 总候选区段"，strict 与 actual 各一份。**它决定的是"值不值得投入实现 2B"，不是"要不要默认开启"**：≥ 50% 进入实现；低于 50% 延后，但不"预期不做"。默认开启由 lag1 §13.3 的 20 任务 A/B 决定。
 
-**局限（必须写进报告）**：模拟假设"被遮蔽后模型行为不变"。真实的步数变化、重读行为只能靠阶段 4 的真跑。模拟只回答"账算不算得过来"，不回答"模型会不会变笨"。
+**四条局限（必须写进报告首节，不能放脚注）**：
+
+1. **行为不变假设**：模拟假设"被遮蔽后模型的步数、重读行为不变"。真实变化只能靠 lag1 的 **M4 A/B** 真跑测出（不是总览里的"阶段 4 子 agent"——那是另一件事，v1.1 这里编号写错了）。
+2. **成本只算了 token 账**：`Δ` 不含 re-read 的行为成本。一次多余 `read` 约 10k 当量，而 `Δ` 的量级是几百到 2k——`re_read_rate` 涨 20% 就能吃掉几十条遮蔽的收益（见 `interface-contract.md` §4）。所以判据给的是**上界**。
+3. **不能单独作为 go/no-go**：模拟同时存在高估代价（v1.1 的 per-item `S` 重复计费）与高估覆盖（`concluded` 近似）两个方向的偏差。v1.2 已修正这两处，但即使修正后它仍只是"账"，不是"行为"。它用于**决定是否投入实现**；开启与否必须走 A/B。
+4. **`S` 的分布比总数重要**：如果 `S` 的 P90 远大于中位数，说明有相当一部分候选离尾部很远——那不是参数问题，是游标判定出了问题，应先查 `computeEligible` 而不是调 `minRatioOverSuffix`。
 
 ---
 
@@ -325,7 +351,14 @@ ctx-report check --dir <sessionsDir>            # 只做健康检查，秒级
 | `calibrate` | session 目录 | 校准系数与 MAPE | 同上 |
 | `check` | 目录 | 会话数、分支数、usage 覆盖率、异常 entry 数 | 同上 |
 
-**只读断言**：每个子命令启动与结束时各算一次输入文件 sha256，不一致则退出码 3 并报错。
+**只读断言**：分两种情形，不能一刀切。
+
+| 会话状态 | 判定依据 | 断言 |
+|---|---|---|
+| **已关闭** | mtime 早于扫描开始 ≥ 5 分钟 | 全文 sha256 前后一致，不一致退出码 3 |
+| **活跃** | 文件在扫描期间可能被 pi 追加 | 只校验**已读前缀** `[0, startOffset)` 的 sha256 一致；文件变长属正常，不报错 |
+
+v1.1 写的是"每个子命令启动与结束时各算一次输入文件 sha256，不一致则退出码 3"。这会让每个活跃会话稳定失败——pi 在扫描期间追加一行就触发，而活跃会话恰好是最值得分析的那批。改为前缀校验之后，`live` 会话在 report 首行标注："该会话在扫描期间被写入，以下结论基于前 N 行的快照。"
 
 ---
 
@@ -342,7 +375,7 @@ input,cache_read,cache_write,output,overhead_est,compaction,masked_sim,sim_savin
 
 ```
 # 会话度量报告 <sessionId>
-> 口径说明 / 估算误差 MAPE / 数据缺口警告
+> 口径说明 / 预测误差 mape_holdout（与拟合误差 mape_insample 分列）/ 数据缺口警告 / live 会话标记
 
 ## 1. 结论摘要（三行以内，直接给判断）
 ## 2. 归因（五维表）
@@ -377,9 +410,9 @@ input,cache_read,cache_write,output,overhead_est,compaction,masked_sim,sim_savin
 ## 10. 验收标准
 
 1. 对 ≥ 3 个真实会话跑通，无未捕获异常；未知 entry 类型计数 > 0 也不中断
-2. 有 usage 的会话，MAPE ≤ 15%（阶段 0 的硬门槛，因为后续所有金额计算都靠它）
+2. 有 `usage` 的会话，**`mape_holdout` ≤ 25%**（留出轮次口径，不是全量拟合口径，见 §3.1）
 3. `report.md` 必须能直接回答四个问题：工具输出占比多少、top 5 消耗源、是否值得遮蔽、缓存是否在抖
-4. 只读断言通过：输入文件 sha256 前后一致
+4. 只读断言通过：已关闭会话全文 sha256 一致；活跃会话已读前缀 sha256 一致且标注 `live`（见 §7）
 5. 100MB 会话运行时间 < 30s（纯流式解析，不建全量索引）
 6. 同一输入两次运行，`report.json` 逐字节相同（时间戳只进顶层 `generatedAt`）
 
@@ -402,9 +435,9 @@ input,cache_read,cache_write,output,overhead_est,compaction,masked_sim,sim_savin
 | 序号 | 交付 | 验收 |
 |---|---|---|
 | 1 | 解析层：流式读 JSONL、树重建、leaf 选择、双口径 token 统计 | 能打印单会话的 turns/steps/tool_calls 与 raw/effective 总量 |
-| 2 | 估算器 + 校准 + 残差报告 | 三个会话输出 MAPE；MAPE > 30% 时报告带警告 |
+| 2 | 估算器 + 校准 + 残差报告 | 三个会话输出 `mape_holdout` 与 `mape_insample`；`mape_holdout > 25%` 时报告只输出占比、不输出金额 |
 | 3 | 归因（五维）+ 缓存抖动检测 + 重复错误检测 | `report.md` 生成，四个问题都能回答 |
-| 4 | 遮蔽模拟（逐轮递推）+ 敏感性分析 + 判定输出 | `sim.json` + 结论段落；与设计文档 §2.4 的回本表量级一致 |
+| 4 | 遮蔽模拟（逐轮递推，复用 `computeEligible`）+ 敏感性分析 + strict/actual 双口径 | `sim.json` + 结论段落；与 lag1 §2.4 的回本表量级一致；两口径差值可解释 |
 
 第 4 步的验收有个隐含校验：**如果模拟出的 `S` 中位数远超 5k，说明 lag-1 的判定实现有问题**（因为 lag-1 的定义就是"改动点之后只有一个回合"）。这会反过来验证阶段 2 的实现前提。
 
@@ -444,3 +477,16 @@ input,cache_read,cache_write,output,overhead_est,compaction,masked_sim,sim_savin
 | 新增第三个输出（§6.5） | 只输出收益曲线与敏感性 | 增加"判据占比"，它是 2B 决策的唯一输入 |
 
 指标口径、五维归因、缓存抖动检测、重复错误检测**均未改动**。
+
+**v1.2 · 2026-11-02**
+
+| 改动 | 原内容 | 原因 |
+|---|---|---|
+| **遮蔽模拟改为"一轮一区段"**（§6.5） | 对每条消息各算一次 `Δ`、各取自己的 `S` | 多条一起遮时真实代价只有最早改动点的一次前缀失效；逐条算把重叠的 `S` 加了多次，**系统性高估代价**。这是"乐观政策 + 悲观加总"里的悲观那一半 |
+| **`concluded` 近似被删除**（§6.5） | "阶段 0 可先按下一轮即视为收尾" | 乐观的那一半。真实 I4 要三信号，多数结果等得更久。改为输出 strict / actual 两口径夹逼 |
+| 判据占比的用途收窄（§6.5） | "这是 2B 做不做的唯一依据" | 它只决定"值不值得投入实现"；"要不要默认开启"由 lag1 §13.3 的 A/B 决定 |
+| 新增四条局限且升到报告首节（§6.5） | 一条脚注式的"行为不变假设" | 补上 re-read 成本缺口、`S` 分布优先于总数、"账≠行为" |
+| `MAPE ≤ 15%` → `mape_holdout ≤ 25%`（§3.1、§10） | 全量拟合的 MAPE，硬门槛 15% | 全量口径在 `usage` 完整时衡量的是拟合而非预测；而模拟要对未来轮次估算。改为 80/20 留出预测，门槛 25% |
+| 只读断言分活跃/已关闭（§7、§10 验收 4） | 全文 sha256 前后一致 | 活跃会话在扫描期间必然被追加，一刀切会让最值得分析的会话稳定退出码 3 |
+| `SimEvent` 结构改为区段级（§4） | 单消息级，`entryId` | 与"一轮一区段"对齐，新增 `span` / `caliber` / `paybackOk` |
+| "阶段 4 真跑" → lag1 的 M4（§6.5） | 阶段 4 | 总览里的阶段 4 是子 agent 隔离，与遮蔽 A/B 无关 |

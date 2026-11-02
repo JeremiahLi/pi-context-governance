@@ -2,7 +2,7 @@
 
 版本 v1.1 · 2026-11-02（v1.0 · 2026-10-30）
 所属：上下文治理方案 阶段 3（四份里最重、长期价值最高）
-位置：**第 3 位**（0 度量 → 2A 无损 → **3** → 2B → 1 → 4）。之所以排在 2B 之前，是因为 2B 的 I4（结论先行）要靠本文的 decisions 记录提供证据链。
+位置：**第 3 位**（0 度量 → 2A 无损 → **3** → 2B → 1 → 4）。之所以排在 2B 之前，是因为 2B 的 I4（使用机会覆盖，见 lag1 §4.1）最强的两个信号——decision 引用与步骤收尾——都由本文提供。
 前置：阶段 0（度量）
 被谁依赖：阶段 2B 的 I4 依赖本文的 decisions 记录；阶段 4（子 agent）依赖本文的 handoff
 硬约束：**输出质量出现任何可感知下降即不可接受**。本文是整套方案里唯一"减少上下文的同时提高可靠性"的机制——它的收益不靠省 token 兑现，所以也是唯一不会因质量约束被削减的部分。
@@ -62,24 +62,31 @@ pi 官方立场是"No built-in to-dos，用 TODO.md 就行"。**如果你只需�
 ## 3. 文件布局
 
 ```
+~/.pi/agent/state/<projectId>/facts/
+  <sessionId>.jsonl        # 事实日志（会话级，只追加）—— 仓库外
+
 <repo>/.pi/state/
-  plan.md                 # 计划与进度（项目级，跨会话）
-  decisions.md            # 判断记录（项目级，跨会话）
-  constraints.md          # 约束（项目级，人写为主）
-  facts/
-    <sessionId>.jsonl      # 事实日志（会话级，只追加）
-  handoff.md              # 交接包（自动生成，可手补）
-  .gitignore 建议         # 默认建议把 facts/ 和 handoff.md 排除
+  plan.md                  # 计划与进度（项目级，跨会话，可提交）
+  decisions.md             # 判断记录（项目级，跨会话，可提交）
+  constraints.md           # 约束（项目级，人写为主，可提交）
+  handoff.md               # 交接包（自动生成，可手补，建议不提交）
 ```
 
 为什么这样分：
 
-| 文件 | 生命周期 | 理由 |
-|---|---|---|
-| `plan.md` / `decisions.md` | 跨会话、随项目 | 一个项目的计划不该因换会话而消失 |
-| `facts/<session>.jsonl` | 会话级 | 避免单文件无限增长；跨会话合并靠注入时聚合 |
-| `constraints.md` | 长期 | 约束是项目级的，通常比会话长命 |
-| `handoff.md` | 每次生成 | 一次性的交接视图，随时可重建 |
+| 文件 | 生命周期 | 位置 | 理由 |
+|---|---|---|---|
+| `plan.md` / `decisions.md` | 跨会话、随项目 | 仓库内 | 一个项目的计划不该因换会话而消失；人要看、要 review、要进 PR |
+| `facts/<session>.jsonl` | 会话级 | **仓库外**（v1.2 变更） | 命令输出会写进 facts，见下 |
+| `constraints.md` | 长期 | 仓库内 | 约束是项目级的，通常比会话长命，且人要在 code review 里看到它 |
+| `handoff.md` | 每次生成 | 仓库内 | 一次性的交接视图，随时可重建；放仓库内但不建议提交 |
+
+**`facts/` 为什么必须离开仓库**（v1.2 变更）：v1.1 把它放在 `<repo>/.pi/state/facts/`，并写"`.gitignore` 建议把 `facts/` 排除"。两处都靠不住——
+
+1. "建议"不是"强制"。一次 `git add .` 就进去了，而事实日志里有完整的命令输出。
+2. 即使忽略了，工作区里仍然躺着一份`.pi/state/facts/*.jsonl`，任何一次误操作（`git add -f`、打包、发给别人）都会带出去。
+
+而命令输出里的泄漏面比想象中大：`env`、`cat .env`、数据库迁移脚本、带连接串的启动日志。§13 的脱敏规则能盖住常见形态，但它本质上是一个黑名单——黑名单永远有漏。把文件本身移出仓库，比让正则更努力更可靠。
 
 ---
 
@@ -91,21 +98,25 @@ pi 官方立场是"No built-in to-dos，用 TODO.md 就行"。**如果你只需�
 
 ```md
 # 计划 v2（2026-10-30 14:20）
+revision: 7
 
 ## s1 复现问题
 done_when: cmd_exit0:"npm test -- auth"
 status: done（f_7b1）
 
 ## s2 定位根因
-done_when: manual
+done_when: manual                                    # 判断类步骤，不审批
 status: done（f_7c2, D1）
 
 ## s3 在中间件统一校验
 done_when: test:"auth.spec.ts" 且 file_contains:"src/auth.ts":"rateLimit("
+done_when_state: approved                            # proposed → approved，见 §4.2
 status: **blocked** — auth.spec.ts 仍有 2 个失败（f_7e5）
+override: null                                       # 人未干预
 
 ## s4 补测试
 done_when: test:"auth.spec.ts"
+done_when_state: proposed                            # 等待人确认
 status: pending
 
 ## 变更记录
@@ -114,20 +125,47 @@ status: pending
 
 ### 4.2 关键点：`done_when` + harness 求值
 
-- 条目由**模型**写（包括 `done_when`）
+- 条目正文由**模型**写
+- `done_when` 由**模型提议**，经 harness 静态检查 + 人确认后生效（v1.2 变更）
 - `status` 由 **harness** 求值后写入，模型不能直接改
 - 支持的判定器（确定性，无模型参与）：
 
-| 判定器 | 语义 |
-|---|---|
-| `cmd_exit0:"<cmd>"` | 存在一条对应 cmd fact 且 exit=0（最近一次） |
-| `test:"<suite>"` | 对应 test fact 且 failed=0 |
-| `file_contains:"<path>":"<pattern>"` | 当前文件内容含该模式 |
-| `file_exists:"<path>"` | 文件存在 |
-| `git_clean:"<path>"` | 该路径无未提交改动 |
-| `manual` | 需人确认（配置可禁，默认仅对"定位/判断"类步骤开放） |
+| 判定器 | 语义 | 允许用于 |
+|---|---|---|
+| `cmd_exit0:"<cmd>"` | 存在一条对应 cmd fact 且 exit=0（最近一次） | 实现、修复、构建类步骤。**该命令必须在当前 step 内实际执行过** |
+| `test:"<suite>"` | 对应 test fact 且 failed=0 | 验证类步骤 |
+| `file_contains:"<path>":"<pattern>"` | 当前文件内容含该模式 | 实现类步骤。模式长度 ≥ 3，且不能是纯标点 |
+| `file_exists:"<path>"` | 文件存在 | **仅**"新建文件"类步骤；不得单独用于实现类步骤 |
+| `git_clean:"<path>"` | 该路径无未提交改动 | 收尾类步骤 |
+| `manual` | 需人确认（配置可禁，默认仅对"定位/判断"类步骤开放） | 判断类步骤 |
 
-**为什么不让模型直接标 done**：模型有强烈的"宣布完成"倾向——它会把"我改完了"当成"问题解决了"。让 `status` 从可验证条件推导，等于把"完成"的定义权从模型手里拿走。这是本设计里唯一一处**故意不信任模型**的地方。
+**为什么不让模型直接标 done**：模型有强烈的"宣布完成"倾向——它会把"我改完了"当成"问题解决了"。让 `status` 从可验证条件推导，等于把"完成"的最终判定权从模型手里拿走。
+
+**但 v1.1 没拿干净。** `done_when` 本身由模型写，于是它可以写 `file_exists:"src/auth.ts"`——而那个文件本来就在；或者 `cmd_exit0:"true"`。谓词确实可验证，但**谓词的选择权仍在模型手里**，这和"自己标 done"只差一道手续。
+
+v1.2 补两层：
+
+**第一层：静态检查（harness，确定性，不调模型）**
+
+| 拒绝条件 | 例子 |
+|---|---|
+| `cmd_exit0` 的命令在当前 step 内没有实际执行过 | 凭空写 `cmd_exit0:"npm test"` 但没跑过 |
+| 命令是平凡真值 | `true`、`echo`、`exit 0`、`cd`、`:` |
+| `file_exists` 单独用于实现类步骤 | `done_when: file_exists:"src/auth.ts"` |
+| `file_contains` 的模式过短或纯标点 | `"}"`、`")"`、长度 < 3 |
+| 一个谓词里出现 `or` 且其中一支是平凡真值 | `test:"a" or cmd_exit0:"true"` |
+
+被拒绝时记 `trivial_predicate_rejected`，并返回一条可直接使用的替代谓词建议。
+
+**第二层：人确认（默认开）**
+
+`plan.requirePredicateApproval = true`（默认）时，新出现的 `done_when` 标记为 `pending_approval`，在注入块里显示"⚠ s3 的完成条件待确认"，且该步骤不因它推进。人可以：
+
+- 确认（把 `pending_approval` 去掉）
+- 改写
+- 对低风险的"定位/判断"类步骤关闭审批（配置层面，不逐条）
+
+**这是本设计里第二处故意不信任模型的地方**，第一处是 `status` 求值。v1.1 说"这是唯一一处"是不准确的——只拿走了判定权、没拿走定义权，等于只做了一半。
 
 ### 4.3 求值时机
 
@@ -200,7 +238,7 @@ status: pending
 
 步骤结束时**强制**：没有新增 decision 就不允许进入下一步（配置 `requireDecisionPerStep`，默认对"有代码改动"的步骤开启）。
 
-理由：不强制就永远不写。这是唯一能保证 I4（结论先行）成立的手段——2B 的 `conclusionRef` 直接指向这里的条目 id。
+理由：不强制就永远不写。这是让 I4（使用机会覆盖）**最强信号**可用的唯一手段——2B 的 decision 引用直接指向这里的条目 id；没有 decisions，2B 只能靠最弱的"被后续结果覆盖"信号，机制仍运行，但移出不可审计。
 
 ---
 
@@ -221,7 +259,36 @@ status: pending
 规则：
 - `## 生效` 区只有人能写。harness 拒绝模型写入该区（写进去会被丢弃并记一条 `rejected_write`）
 - `## 待确认` 区模型可追加，注入时**明确标为"未确认，仅供参考"**
-- 注入块里只放生效区，且硬上限 10 条（超了按时间倒序截断，并在注入块标注"还有 N 条"）
+- 注入块里只放生效区，**永不按时间截断**（v1.2 变更，理由见 §7.1）
+
+### 7.1 为什么不能按时间截断
+
+v1.1 写的是"硬上限 10 条，超了按时间倒序截断，并在注入块标注'还有 N 条'"。这条与本节自己的目的正好相反：
+
+- **约束不是时序数据。** 最新写下的不等于最重要。最早那条 `不要修改 migrations/` 往往是最硬的禁令，按时间倒序截断让它第一个从模型眼前消失。
+- **它会让 `constraint_violation = 0` 失去意义。** 约束已经不在上下文里了，此时再统计"模型是否违反"，统计的是一个已经不再成立的场景。
+
+v1.2 改为**优先级 + 降级渲染**：
+
+| 情况 | 渲染 |
+|---|---|
+| 生效区条数 ≤ `inject.maxConstraints`（10） | 全部行全文 |
+| 超出预算 | 按**人标注的优先级**降级：`P0` 全文、`P1` 一行摘要、`P2` 只计入"另有 N 条" |
+| 未标注优先级 | **全部按 P0 处理**——宁可超预算，不可丢 |
+| 超过 `constraints.hardLimit`（15） | 拒绝新增，提示人精简 |
+
+优先级由人在 `constraints.md` 里显式写：
+
+```md
+## 生效
+- C1 [人][P0] 不要修改 migrations/ 下任何文件（历史迁移已上线）
+- C2 [人][P1] 用 pnpm，不要用 npm 生成 lockfile
+- C3 [人][P0] 验收标准：auth.spec.ts 全绿 + 手动验证 429 返回
+```
+
+标注格式不合法（如 `[P9]`）按 `P0` 处理，不猜、不丢弃。
+
+预算超了记 `inject_overbudget` 并告警——**让人来处理，而不是让渲染器替人决定哪条约束可以消失**。这是"约束不可遗忘"与"注入块大小恒定"两条硬约束打架时唯一正确的让步方向。
 
 ---
 
@@ -246,7 +313,7 @@ open: D3 的"按路由差异化"待定 · [stale] middleware.ts 已被改，f_6a
 
 | 约束 | 理由 |
 |---|---|
-| 只在**尾部**注入 | 插在历史中间或 system 附近会让后续前缀全部失效 |
+| 只在**这一次请求的尾部**注入，**不进历史** | 插在历史中间或 system 附近会让后续前缀全部失效；写进历史则会逐轮累积（见 §8.4） |
 | 大小**恒定** | 否则注入块本身成为新的膨胀源（Letta 的 memory block 就是这么烂掉的） |
 | 只取**活跃**部分 | 当前+下一步、全部生效约束、最近 3 条事实、未决判断、最多 3 条 stale |
 
@@ -255,9 +322,10 @@ open: D3 的"按路由差异化"待定 · [stale] middleware.ts 已被改，f_6a
 注入块由函数生成，输入是"活跃集"，输出长度与轮数无关：
 
 ```
-active = { currentStep, nextStep, activeConstraints[0:10],
+active = { currentStep, nextStep,
+           activeConstraints,        # 全部生效约束，按优先级降级渲染；不按时间截断（§7.1）
            recentFacts[-3:], openDecisions, staleWarnings[0:3] }
-inject = render(active)      # 500 ± 150 token
+inject = render(active)      # 500 ± 150 token；超预算记 inject_overbudget，不丢约束
 ```
 
 **验收里有一条专门测这个**：注入 token 的 P95/P50 < 1.3（不随轮数增长）。
@@ -268,21 +336,47 @@ inject = render(active)      # 500 ± 150 token
 
 ---
 
-### 8.4 旧注入块的回收（v1.1 新增，修补 v1.0 的漏洞）
+### 8.4 旧注入块：不写入历史（v1.2 重写）
 
-**问题**：§8.1 说"只在尾部注入、大小恒定"，但**上一轮的注入块会留在历史里**，没有任何机制回收它。2B 只处理工具结果，2C 已删除——所以它是纯粹的单向累积，`500 token/轮`，50 轮就是 25k。这恰好是 §8.1 想避免的"注入块自己变成新的膨胀源"。
+**问题**：§8.1 说"只在尾部注入、大小恒定"，但**上一轮的注入块会留在历史里**。2B 只处理 tool result（lag1 §5.3 的 `isToolResultMessage` 直接 `continue`），2C 已删除——所以它是纯粹的单向累积，`500 token/轮`，50 轮就是 25k。这正是 §8.1 想避免的"注入块自己变成新的膨胀源"。
 
-**决定**：承认它会留在历史里，但把它纳入 2B 的回收节奏。
+**v1.1 列了三种做法，加上它没列的那种，四种都不成立**：
 
-| 做法 | 代价 | 结论 |
+| 做法 | 50 轮总成本（c=0.1, w=1.0） | 问题 |
 |---|---|---|
-| 每轮追加新块、从不回收 | `c·500` 的持续读价，线性增长 | 短期可接受（几十轮的会话感觉不到），长期不行 |
-| 每轮删旧块、插新块 | 在旧块位置改动 → 付 `w·m + (w−c)·S`，`S` ≈ 一个回合（约 2k）≈ 2k 当量 | **比留下的 500 更贵**，不划算 |
-| **把旧块当普通历史内容，按 lag-1 节奏交给 2B 移出** | 与其他工具结果共享同一次尾部改写，代价合并 | **采用** |
+| 全留、永不回收 | `Σ 0.1×500×(n−1) ≈ 6.1 万` 当量 | 线性增长，正是要避免的 |
+| 每轮删**最旧**的块、插新块 | 改动点在最早处，`S` ≈ 其后全部历史 | **最贵**。v1.1 估 `S ≈ 2k` 只对"改最新那块"成立 |
+| 每轮删**最新**那块、插新块 | `S ≈ 0`，但更早的块仍在累积 | 只挪动问题，没有解决 |
+| 交给 2B 回收 | 取决于 2B 是否开启 | **2B 默认关且排在阶段 3 之后**——阶段 3 单独上线时没有回收者；而且 2B 不认 `custom` message，要改算法 |
 
-实现要点：注入块在内部编码为一条 `custom` message，带 `injectSeq` 标记；当它落后于尾部一轮以上时，交给 2B 的同一套判定处理，渲染为一行 `[state snapshot @s12 · 7 steps · 3 constraints]`，指针指向 `.pi/state/`。
+**v1.2 的决定：注入块不写入 session，不作为 entry 存在。**
 
-**验收指标必须改**：v1.0 的 `inject_tokens` 只量最新一块，测不出累积。增加 `inject_tokens_total`（当前上下文里所有注入块的 token 之和），目标 `< 3× 单块预算`。
+```
+每轮组装：
+  msgs = buildContextEntries(leafPath)      # 历史里从来没有注入块
+  msgs.append(renderInjection(active))      # 临时拼接，只存在于这一次请求
+  发送 → 模型
+  （发完即弃：不落盘、不作为 entry、不参与下一轮 eligible 计算）
+```
+
+**为什么这是唯一正解**：注入内容**每轮都变**。把它存进历史，对前缀缓存没有任何好处——它既不能作为稳定前缀被复用（内容变了），又必须被移出（否则累积）。一件东西既不增值、又必须清理，正确做法是从来不放进去。
+
+§8.1 说"只在尾部注入"是对的，但"尾部"应当理解为**这一次请求的尾部**，不是**历史的尾部**。v1.0 和 v1.1 都在后一种读法上打补丁，所以越补越复杂。
+
+**代价与前提**：
+
+- 需要 pi 扩展支持"只在发出去的请求里拼接、不回写 session"。这是 **Day 0 探针的必验项**（overview §8）。
+- 若平台不支持，退化为"注入块作为 entry 写入 + 按 lag-1 遮蔽"。此时**必须同时开启 2B**，否则 500 token/轮线性增长。这条退化路径就是 v1.1 的现状，只作 fallback，不作默认。
+
+**验收**（替代 v1.1 的"`< 3× 单块预算`"）：
+
+| 指标 | 目标 | 含义 |
+|---|---|---|
+| `inject_tokens`（单块） | P95/P50 < 1.3 | 块内恒定 |
+| `inject_tokens_total` | **≈ `inject_tokens`**（比值 < 1.6） | 上下文里只有当前这一块 |
+| `inject_persisted` | **= 0** | 注入块出现在 session JSONL 里的次数；非 0 说明拼接渗进了历史 |
+
+v1.1 的"`< 3× 单块预算`"是个妥协值：它容忍两块，等于承认累积。临时拼接下这个余量没有存在的理由。
 
 ---
 
@@ -292,10 +386,10 @@ inject = render(active)      # 500 ± 150 token
 
 | 时机 | 校验什么 | 失败处理 |
 |---|---|---|
-| 每轮组装 | 当前 step 的 `done_when` | status 重算，可能从 done 退回 blocked |
+| 每轮组装 | 当前 step 的 `done_when` | `status` 重算，可能从 done 退回 blocked。**只写 `status`，永不碰 `override`**（§12.2） |
 | 每轮组装 | `recentFacts` 里引用的 path 的 sha | 标记 `[stale]`，不删除记录 |
 | 步骤转换 | 前一步的全部 `done_when` | 写回 status；若与模型声称不符，记 `done_claim_mismatch` |
-| 启动 | `facts` 末行完整性、plan 语法 | 跳过残缺行；语法错误则保留旧版并告警 |
+| 启动 | `facts` 末行完整性、plan 语法、`revision` | 跳过残缺行；语法错误则保留旧版并告警；`revision` 与锁不一致则拒绝写入 |
 
 **标脏而不是修正**：sha 变了说明世界变了，但"变成了什么"只有重新观察才知道。harness 不猜，只标 `[stale]`，让模型决定要不要重读。修正等于替模型做判断，那是越权。
 
@@ -343,7 +437,7 @@ compaction 之后，历史被摘要替代，但 state 完整保留。**这就是
 | 判断"该步骤是否已收尾" | `plan.md` 的 status（由 `done_when` 推导，非模型声称） |
 | recall 时的"世界是否已变" | `facts` 里的 path + sha |
 
-**所以阶段 3 必须在 2B 之前或同时上线。** 如果先上 2B 而 state 没做，I4 就只能靠"模型说有结论"来判断——那等于没有判断，遮蔽会在证据被使用之前把它丢掉。
+**阶段 3 仍应先于 2B 上线，但性质变了**：没有 state 时，2B 的 I4 只能靠最弱的第三信号（"被后续结果覆盖"），机制仍能运行，但每次移出都无法回答"凭什么当时可以移走"；有 state 时，前两个信号（被 decision 引用 / 步骤收尾）可用，移出可审计。这是**强弱之分，不是有无之分**——v1.1 把它写成硬前置，与 lag1 v1.2 的 I4 三信号不一致了（见 lag1 §4.1、§15）。
 
 ---
 
@@ -359,23 +453,68 @@ compaction 之后，历史被摘要替代，但 state 完整保留。**这就是
 | `facts/` | ❌ | 事实不可编辑，只能追加新观察 |
 | `handoff.md` | ✅（标 `[人]`） | 补充隐含背景 |
 
-### 12.2 冲突处理：人优先，但必须显式提示
+### 12.2 冲突处理：人优先，且不能被重算覆盖
 
-人改了 plan 但 harness 的 facts 显示不同状态时：
+`plan.md` 有**三个写者**，必须做字段级隔离。v1.1 只说"人可改 plan"，没说人改的 status 会不会被 harness 覆盖——按 §9 的"每轮组装重算 status"，答案是会。于是：
+
+```
+人把 s3 改成 done
+  → 下一轮组装，harness 重算 done_when 未满足，把 status 写回 blocked
+  → §12.2 那句"人已把 s3 标为 done"的冲突提示永远不会出现，因为 status 已经不再是 done
+```
+
+人和 harness 抢同一个字段，谁后写谁赢，而 harness 每轮都写。人的修正在下一个心跳被静默吃掉。
+
+**v1.2 引入独立的 `override` 字段**：
+
+| 字段 | 唯一写者 | 模型能否写 |
+|---|---|---|
+| 条目正文、`done_when` | 模型（提议）+ 人（确认） | 能写，但不能自行生效（§4.2） |
+| `status` | **harness**（每轮求值） | 不能 |
+| `override` | **人** | 不能 |
+
+`override ∈ {done, blocked, null}`。渲染规则：
+
+- `override == null` → 用 `status`
+- `override != null` 且与 `status` 一致 → 用 `status`，不提示
+- `override != null` 且与 `status` 冲突 → **按 override 显示，并附冲突提示**
 
 ```
 [state]
-⚠ 人已把 s3 标为 done，但 done_when 未满足（auth.spec.ts 仍 2 failed · f_7e5）
+⚠ 人已把 s3 标为 done（override），但 done_when 未满足（auth.spec.ts 仍 2 failed · f_7e5）
   按人的标记继续，还是先修测试？
 ```
 
+**重算只写 `status`，永远不碰 `override`**，所以人的决定不会被下一轮吃掉。冲突提示则每一轮都会重现，直到人把它清掉——这正是想要的：冲突不解决就一直可见。
+
 **不做冲突提示 = 人的修正会被静默忽略**，这是这类系统最常见的失效方式：人以为自己改了，模型按旧状态继续。
 
-### 12.3 写保护
+### 12.3 写保护：挂在 `edit` / `write` 的路径上
 
-- 模型写 `constraints.md` 的生效区 → 丢弃 + 记 `rejected_write`
-- 模型改写 `plan.md` 的 status 字段 → 丢弃（status 只由 harness 写）
-- 模型删 `decisions.md` 的历史条目 → 拒绝（只允许追加与标"已推翻"）
+**保护不能只做在状态 API 上。** 模型有通用的 `edit` / `write` 工具，它知道 `.pi/state/` 的路径——只要它想写，就能直接改文件，绕过所有语义层的检查。v1.1 只写了"模型写生效区 → 丢弃"，没有说明这条检查挂在哪一层，实现时最省事的做法就是挂在状态 API 上，然后被一次普通 `edit` 绕过去。
+
+守卫必须下沉到工具入口：任何对 `.pi/state/**` 的写请求，先解析出**改动的行区间**，再按受保护区判定。
+
+| 文件 / 区域 | 模型可写 | 违规处理 |
+|---|---|---|
+| `plan.md` 条目正文、`done_when` | ✅（`done_when` 记 `pending_approval`） | — |
+| `plan.md` 的 `status` 行 | ❌ | 丢弃该行改动 + `rejected_write` |
+| `plan.md` 的 `override` 行 | ❌ | 同上 |
+| `constraints.md` 的 `## 生效` 区 | ❌ | 丢弃 + `rejected_write` |
+| `constraints.md` 的 `## 待确认` 区 | ✅（只允许追加） | — |
+| `decisions.md` 的历史条目 | ❌ 删除/改写；✅ 追加 | 拒绝，提示"用追加 + 标已推翻" |
+| `facts/**` | ❌ 任何写入 | 拒绝（事实只能由 harness 追加） |
+| `handoff.md` | ✅（需带 `[人]` 标记） | — |
+
+**判定粒度是行区间，不是整个文件**：改 `plan.md` 的条目正文是允许的，同一文件里的 `status` 行不允许，所以必须先定位 `oldText` 落在哪个区。
+
+这套守卫与阶段 1 的 I7 共用同一个"定位 `oldText` 行区间"的实现，不新增解析成本。两者都是"先在磁盘上定位，再判断这块位置是否被允许操作"，只是判据不同：I7 看"读过没有"，这里看"是谁的地盘"。
+
+**并发写**：`plan.md` 三人可写，必须加锁。
+
+- 写前取 `.pi/state/plan.md.lock`（O_EXCL 创建），写后释放
+- 文件头写 `revision: N`，写入时比对，不一致则失败并提示"文件已被他人修改，请重读"
+- 不做自动 merge——三个写者的语义不同（模型写条目、harness 写 status、人写 override），自动合并会把一方的意图抹掉
 
 ---
 
@@ -383,17 +522,22 @@ compaction 之后，历史被摘要替代，但 state 完整保留。**这就是
 
 | key | 默认 | 说明 |
 |---|---|---|
-| `state.dir` | `.pi/state` | 目录 |
+| `state.dir` | `<repo>/.pi/state` | 计划 / 判断 / 约束 / 交接 |
+| `state.factsDir` | `~/.pi/agent/state/<projectId>/facts` | **仓库外**（v1.2 变更，理由见 §3） |
 | `inject.budgetTokens` | `500` | 目标 500，硬上限 800 |
-| `inject.maxConstraints` | `10` | |
+| `inject.transient` | `true` | **不写入 session**，只在请求尾部临时拼接（§8.4）。**关掉它等于回到会累积的旧方案** |
+| `inject.maxConstraints` | `10` | 超出后按人标注的优先级降级渲染，**不按时间截断**（§7.1） |
 | `inject.recentFacts` | `3` | |
 | `inject.staleWarnings` | `3` | |
 | `plan.evaluateOnAssemble` | `true` | 每轮求值当前+下一步 |
 | `plan.allowManualDone` | `true` | `manual` 判定器是否允许（仅判断类步骤） |
+| `plan.requirePredicateApproval` | `true` | `done_when` 需人确认后生效（§4.2） |
+| `plan.rejectTrivialPredicates` | `true` | 拒绝平凡真值谓词（§4.2） |
+| `plan.lockTimeoutMs` | `2000` | `plan.md` 的写锁等待上限（§12.3） |
 | `decisions.requirePerStep` | `true` | 有代码改动的步骤必须有 decision |
 | `facts.retentionDays` | `30` | 超期归档为 .gz |
 | `constraints.hardLimit` | `15` | 超了拒绝新增并提示精简 |
-| `redact` | 见阶段 2 §3.5 | facts 落盘前脱敏 |
+| `redact` | 见 `interface-contract.md` §5 | facts 落盘前脱敏，七条规则 |
 
 ---
 
@@ -402,29 +546,35 @@ compaction 之后，历史被摘要替代，但 state 完整保留。**这就是
 | 指标 | 定义 | 目标 |
 |---|---|---|
 | `inject_tokens_p95/p50` | **单块**注入 token 的分布 | 比值 < 1.3（块内恒定性） |
-| `inject_tokens_total` | 上下文中所有注入块之和 | < 3× 单块预算（防累积，见 §8.4） |
+| `inject_tokens_total` | 上下文中所有注入块之和 | **≈ 单块**（比值 < 1.6，见 §8.4） |
+| `inject_persisted` | 注入块出现在 session JSONL 里的次数 | **= 0**（非 0 说明临时拼接渗进了历史） |
+| `inject_overbudget` | 注入预算超限的次数 | 仅观测；非 0 时告警，由人精简约束，不自动截断 |
 | `stale_rate` | 标脏条目 / 总引用条目 | < 20%（高说明校验太频繁或 world 变化太快） |
 | `done_claim_mismatch` | 模型声称完成但 `done_when` 不满足的次数 | **必须为 0**（正确性断言） |
+| `trivial_predicate_rejected` | 平凡真值谓词被静态检查拒绝的次数 | 仅观测（非 0 说明模型在试 `file_exists`/`true` 这类绕过） |
+| `predicate_pending_ratio` | `done_when_state = proposed` 的步骤 / 总步骤 | 仅观测（长期偏高说明人没在确认） |
+| `override_conflict_shown` | `override` 与 `status` 冲突并提示的次数 | 仅观测（非 0 说明人在介入，是好事） |
 | `constraint_violation` | 违反生效约束的次数 | **必须为 0**（最重要的质量指标） |
 | `cold_start_success` | 仅凭 state 继续的任务成功率 | ≥ 80% |
 | `decision_reuse` | 后续引用了多少条 decision | 仅观测（低说明判断没被复用，可能在重复试错） |
 | `human_edit_count` | 人修改次数 | 仅观测（长期为 0 说明可编辑是摆设） |
 | `rejected_write` | 模型越权写被拒次数 | 仅观测（高说明提示词没讲清楚权限） |
 
-`done_claim_mismatch` 和 `constraint_violation` 是断言型指标，不是优化目标——非 0 就是 bug。
+`done_claim_mismatch`、`constraint_violation`、`inject_persisted` 是断言型指标，不是优化目标——非 0 就是 bug。
 
 ---
 
 ## 15. 验收
 
 1. **冷启动**：10 个任务各做到 60% 后杀进程，新会话只加载 state 继续，成功率 ≥ 80%
-2. **约束遵守**：20 个任务中注入 3 条约束，违反次数 = 0
-3. **done 真实性**：`done_claim_mismatch = 0`；抽查 10 个 done 条目，全部有 fact 支撑
-4. **注入恒定**：50 轮会话里单块 `inject_tokens` 的 P95/P50 < 1.3，且 `inject_tokens_total < 3× 单块预算`（后者才防得住累积）
-5. **人改生效**：人改 plan 后，下一轮注入块反映修改；与 facts 冲突时出现显式提示
-6. **越权拦截**：模型尝试写 constraints 生效区 / 改 status / 删 decision，全部被拒并计数
+2. **约束遵守**：20 个任务中注入 3 条约束，违反次数 = 0；再注入 12 条（超 `maxConstraints`）验证按优先级降级、**最早的 P0 约束仍在**（§7.1）
+3. **done 真实性**：`done_claim_mismatch = 0`；抽查 10 个 done 条目，全部有 fact 支撑；构造 3 个平凡谓词（`file_exists` / `true` / 短模式 `"}"`），全部被静态检查拒绝（§4.2）
+4. **注入不累积**：50 轮会话里单块 `inject_tokens` 的 P95/P50 < 1.3，`inject_tokens_total / inject_tokens < 1.6`，且 **`inject_persisted = 0`**（§8.4）
+5. **人改生效且不被覆盖**：人设 `override: done` 后，连续三轮 harness 重算仍显示 override 与冲突提示；`status` 字段被更新但 `override` 未被改写（§12.2）
+6. **越权拦截覆盖 `edit`/`write` 路径**：不只测状态 API——直接用 `edit` 改 `plan.md` 的 `status` 行、改 `constraints.md` 生效区、写 `facts/`，全部被拒并计数（§12.3）
 7. **崩溃安全**：facts 末行残缺时能正常加载
-8. **脱敏**：facts 与注入块中无明文密钥
+8. **脱敏**：facts 与注入块中无明文密钥；构造含 JWT、`postgres://user:pass@host`、`.env` 整行的命令输出，三者在 facts 里都不出现明文（contract §5 规则 3/5/7）
+9. **facts 不在仓库内**：`git status` 中不出现 `facts/`，`git check-ignore` 对它返回非零（它根本不在仓库树里，不是被忽略了）
 
 ---
 
@@ -434,13 +584,18 @@ compaction 之后，历史被摘要替代，但 state 完整保留。**这就是
 |---|---|---|
 | 模型不写 decision | 提示词没约束住 | `requireDecisionPerStep` 强制；没有 decision 不允许进下一步 |
 | 模型忽略 state，还是靠对话历史 | state 位置太靠前 / 太长 | 放在尾部最后；压缩到 500 token；冷启动测试会暴露 |
-| 注入块越用越大 | 活跃集定义太宽 | 硬上限 + 只取最近 N 条；用 P95/P50 监控 |
+| 注入块越用越大 | 活跃集定义太宽 | 只取活跃集；用 P95/P50 监控块内恒定性 |
+| **注入块越积越多** | 注入块被写进了 session，或 `inject.transient` 被关闭 | 默认不进历史（§8.4）。监控 `inject_tokens_total / inject_tokens` 与 `inject_persisted`；后者非 0 就是拼接渗进了历史 |
+| **最早的约束莫名消失** | 用了"按时间倒序截断" | 改为优先级降级 + 不截断（§7.1）；未标注优先级的按 P0 处理 |
+| **人改的 done 下一轮变回 blocked** | harness 重算覆盖了同一个 `status` 字段 | 引入独立 `override` 字段，重算只写 `status`（§12.2） |
+| **模型绕过写保护** | 守卫只挂在状态 API 上，模型用普通 `edit` 改文件 | 守卫下沉到 `edit`/`write` 入口，按行区间判定（§12.3） |
+| **步骤被平凡谓词判为完成** | `done_when` 由模型写且未审核 | 静态检查 + 人确认（§4.2）；监控 `trivial_predicate_rejected` |
+| facts 里出现明文密钥 | 脱敏规则不全（JWT / 连接串 / `.env`） | 用 contract §5 的七条规则；并且 facts 本身不在仓库内（§3） |
 | plan 变成谎言堆 | status 被模型改写 | status 只由 harness 写；越权写入丢弃 |
 | 人改了没生效 | 无冲突提示 | §12.2 的显式提示是硬要求 |
 | facts 无限增长 | 没有归档 | `retentionDays` + gz 归档 |
 | 冷启动失败 | handoff 缺关键背景 | handoff 允许人补 `[人]` 段；失败案例要复盘补字段 |
 | 每轮求值开销大 | 对全部 step 求值 | 只算当前 + 下一步 |
-| 注入块越积越多 | 旧块无人回收 | §8.4：按 lag-1 交给 2B；监控 `inject_tokens_total` |
 
 ---
 
@@ -451,7 +606,7 @@ compaction 之后，历史被摘要替代，但 state 完整保留。**这就是
 | 1 | 目录与最小 schema：`plan.md` + `constraints.md` + `facts` 三种 kind | 手工建文件能被解析 |
 | 2 | harness 写 facts（挂在工具调用后） | edit/cmd/test 三类事实正确落盘，脱敏生效 |
 | 3 | `done_when` 求值器 + status 写回 | 5 个判定器各有单测；模型改 status 被拒 |
-| 4 | 注入块生成 + 恒定性测试 | 50 轮回归 `inject_tokens` P95/P50 < 1.3 |
+| 4 | 注入块生成 + 恒定性 + 不落盘测试 | 50 轮回归 `inject_tokens` P95/P50 < 1.3，`inject_persisted = 0` |
 | 5 | `decisions.md` 写协议 + 强制校验 | 缺 decision 时无法进入下一步 |
 | 6 | `handoff.md` + 冷启动恢复测试 | 10 个任务成功率 ≥ 80% |
 
@@ -502,4 +657,19 @@ compaction 之后，历史被摘要替代，但 state 完整保留。**这就是
 | §15 验收第 4 条加总预算 | 只验 P95/P50 | 同上 |
 | §16 失败模式加一行 | 无 | 对应 §8.4 |
 
-**未改动的部分**：三个写者的分权（§2）、`done_when` 求值机制（§4）——这是全文的核心，也是唯一"减少上下文同时提高可靠性"的机制；facts 只追加（§5）、decisions 的三个必填字段（§6）、constraints 的人写权（§7）、只在尾部注入（§8.1）、标脏而不修正（§9）、冷启动验收（§10）。
+**未改动的部分**：三个写者的分权（§2）、facts 只追加（§5）、decisions 的三个必填字段（§6）、constraints 的人写权（§7 的原则）、标脏而不修正（§9）、冷启动验收（§10）。
+
+**v1.2 · 2026-11-02**
+
+| 改动 | 原内容 | 原因 |
+|---|---|---|
+| **§8.4 重写：注入块不进历史**（§8.4、§8.1） | "交给 2B 按 lag-1 回收" | 三层链不上：2B 的 `isToolResultMessage` 不认 `custom` message（回收不会发生）；2B 默认关闭（无人回收）；2B 排在阶段 3 之后（阶段 3 单独上线时根本没有它）。改为临时拼接——注入内容每轮都变，存进历史既不增值又必须清理 |
+| 注入成本算术修正（§8.4） | "删旧块插新块更贵，`S ≈ 2k`" | 该估值只对"改最新那块"成立；改最旧那块时 `S` 是其后全部历史。全留 50 轮实测约 6.1 万当量，临时拼接约 2.5 万 |
+| `inject_tokens_total` 门槛收紧（§8.4、§14、§15） | `< 3× 单块预算` | 容忍两块等于承认累积。改为 ≈ 单块（< 1.6），并新增 `inject_persisted = 0` |
+| **约束不按时间截断**（§7.1 新增） | "最多 10 条，超了按时间倒序截断" | 约束不是时序数据；最早的常驻禁令会第一个消失，而 `constraint_violation = 0` 随之失去意义。改为按人标注的优先级降级，未标注按 P0 |
+| **`done_when` 需静态检查 + 人确认**（§4.2） | 谓词完全由模型写 | v1.1 只拿走了 `status` 的判定权，没拿走"完成"的**定义权**——`file_exists` 或 `cmd_exit0:"true"` 就能把步骤标完成。补平凡的谓词黑名单与 `pending_approval` |
+| **引入 `override` 字段**（§12.2） | 只有 `status`，人改会被重算覆盖 | 三个写者共用一个字段，harness 每轮都写，人的修正下一个心跳就被吃掉。改为字段级隔离 |
+| **写保护下沉到 `edit`/`write`**（§12.3） | 只拦状态 API | 模型有通用 `edit`/`write`，知道路径就能改 `.pi/state/` 下任何文件，语义层检查形同虚设。改为按行区间判定的路径守卫 + 文件锁 + `revision` |
+| **`facts/` 移出仓库**（§3） | `<repo>/.pi/state/facts/`，`.gitignore` 建议排除 | "建议"不是"强制"，一次 `git add .` 就进去了；命令输出里的泄漏面比黑名单正则能覆盖的大。参数化到 `state.factsDir` |
+| 脱敏引用 contract（§13） | "见阶段 2 §3.5"（四条正则，且 `$1` 是空） | 统一到 `interface-contract.md` §5 的七条；补 JWT / 连接串 / `.env` |
+| 验收 +2 条、失败模式 +6 行（§15、§16） | — | 覆盖优先级降级、override 不被覆盖、edit 路径绕过、平凡谓词、facts 位置 |

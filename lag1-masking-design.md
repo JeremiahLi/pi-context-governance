@@ -187,13 +187,33 @@ M*(r) = ( w·(1−r) + 0.1 ) / ( 0.1·r )
 | **I1** | **尾部保真**：路径中最新的 tool result 永远完整可见        | 模型在需要事实的那一刻拿不到事实  |
 | **I2** | **边界单调**：遮蔽位置只前进，绝不回退                     | 每次回退 = 一次全量缓存失效   |
 | **I3** | **一次冻结**：同一位置只写一次，之后逐字不变                  | 每次重算 = 全量失效；且不可复现 |
-| **I4** | **结论先行**：没有结论引用该证据时，不得遮蔽                  | 证据消失而无人使用，等于静默失忆  |
+| **I4** | **使用机会覆盖**：证据必须已获得使用机会（三信号任一，见 §4.1），才可遮蔽      | 证据在可能被使用之前消失，等于静默失忆 |
 | **I5** | **移出 ≠ 删除**：被遮蔽的原文必须仍可取得（JSONL 偏移或 blob）  | 出问题时无法审计，也吵不清责任   |
 | **I6** | **决策可重建、渲染不可变**：哪些位置该遮蔽由纯函数决定；遮什么由一次性冻结决定 | 分支切换/重放时状态不一致     |
 
 I6 是唯一一条容易被误解的：**决策**和**渲染**必须分开。
 - 决策是 `f(path, config) → Set<entryId>`，纯函数、无状态、可随时重算 → 天然支持 `/tree`、`/fork`、崩溃恢复。
 - 渲染是"生成一次、存下来、以后只读"→ 天然满足 I3，并且让 sha 漂移（文件后来被改）不会导致渲染文本变化。
+
+### 4.1 I4 为什么从"必须被结论引用"改为"使用机会覆盖"
+
+v1.1 的 I4 表述是"没有结论引用该证据时，不得遮蔽"，并把 `conclusionRef` 当作唯一凭据。**这条在实现上会让机制停摆**：
+
+阶段 3 的 `decisions.md` 是 per-step 的（一个步骤一条 decision，引用少数几个 fact id），而一次探索步骤里通常有十几条工具结果。按"每条结果都必须被 decision 点名"判定，未点名的那些永远不 eligible——游标卡在第一条未点名的结果上，此后整个会话不再遮蔽。这不是"收益变小"，是"第 3 到 5 轮永久停止"。
+
+改法：把"被引用"从一个必要条件降级为三个可替代信号之一。
+
+| 信号 | 语义 | 强度 |
+|---|---|---|
+| 被某条 decision 引用（`conclusionRef`） | 模型明确用它做了判断 | 最强 |
+| 所属步骤已收尾（`plan.md` status 判定） | 该批次工作已经结束 | 中 |
+| 其后已出现 ≥ `config.coverAfter` 条新结果 | 已被后续观察覆盖，不再是"当前事实" | 最弱，但最常用 |
+
+**这是一次显式的语义降级，必须承认代价**：原 I4 保证"证据在被使用之前不会消失"，新 I4 只保证"证据在获得使用机会之前不会消失"。差别在于——模型看过但没写下结论的那条输出，可能在它真正需要之前被移出。
+
+接受这个降级的理由：严格版 I4 的防护效果是 0（机制不运行），而降级版至少有三件事兜底——(1) 遮蔽记录保留 head/tail/highlights，模型能判断是否需要召回；(2) `recall` 可随时取回原文；(3) 阶段 3 的 `requireDecisionPerStep` 仍然强制每步写判断。用"可回溯的移出"换"完全不工作"，是这套方案里最划算的一笔交易。
+
+`requireConclusion` 配置项随之改名 `requireUseOpportunity`（默认 `true`）。
 
 ---
 
@@ -211,9 +231,9 @@ pinned: 用户显式豁免，永不遮蔽（可从任一状态进入）
 
 ### 5.1 触发条件（四条，必须同时满足）
 
-1. **步骤已收尾**：该 result 所属 step 已被标记 concluded，且存在至少一条结论引用了它（I4）。
+1. **使用机会覆盖**（I4，三信号任一）：被某条 decision 引用；或所属步骤已收尾；或其后已出现 ≥ `coverAfter`（默认 2）条新结果。
 2. **滞后满足**：它的位置之后，至少还有一条**完整的** tool result message（I1）。
-3. **体量达标**：`M ≥ max(minTokens, minRatioOverSuffix × S)`（默认 `1000` 与 `4×S`）。门槛来自 §2.4 的回本公式，作用是拦住"遮了但回不了本"的小输出。`4×S` 在大致对应 DeepSeek 上"回本 ≤ 4 轮"，而 OpenAI（c=0.5）上 `1×S` 就已立赚——**这个默认值对 OpenAI 偏保守，保守降低收益但不降低质量，不改**。
+3. **体量达标**：`M ≥ max(minTokens, minRatioOverSuffix × S)`（默认 `1000` 与 `4×S`）。门槛来自 §2.4 的回本公式，作用是拦住"遮了但回不了本"的小输出。**`4×S` 的真实含义是"回本 ≤ 1.5 轮"**（DeepSeek 口径重算，见 `interface-contract.md` §4；v1.1 注释写"回本 ≤ 4 轮"是算错的）。OpenAI（c=0.5）上 `1×S` 就已立赚——**这个默认值对 OpenAI 偏保守，保守降低收益但不降低质量，不改**。
 4. **不在豁免集**：未被 pin（用户正在看的、正在 debug 的）。
 
 ### 5.2 遮蔽单位：message，不是 block
@@ -234,23 +254,43 @@ pinned: 用户显式豁免，永不遮蔽（可从任一状态进入）
 
 ### 5.3 每轮推进的算法
 
-一轮最多遮蔽**一个连续区段**（不是一条）：连续区段一次遮完，只付一次 `(w−c)×span` 的重算差；如果分散到多轮，就要付多次。截断条件保证 I1。
+一轮最多遮蔽**一个区段**：区段一次遮完，只付一次 `(w−c)×S` 的重算差（`S` 由区段里最早那个改动点决定）；如果分散到多轮，就要付多次。
+
+关键是把两类不合格分开处理，这是 v1.2 的核心修正：
+
+| 类别 | 例子 | 处理 |
+|---|---|---|
+| **永久不合格** | pin、已被 compaction 吸收、`M < minTokens` | **越过**。它在本轮不会被遮，也不该挡住后面 |
+| **暂时不合格** | 未获得使用机会（I4 三信号都不满足） | **挡住**。其后任何一条本轮都不遮 |
 
 ```
 function computeEligible(msgs, config):
     lastResultIdx = 最后一个满足 isToolResultMessage 的索引
     span = []
     for i in msgs 索引顺序:
-        if i >= lastResultIdx: break                 # I1：最后一条结果及其后不动
-        if not isToolResultMessage(msgs[i]): continue
-        if pinned(msgs[i]): continue
-        if tokens(msgs[i]) < config.minTokens: continue
-        if not concluded(msgs[i], config): continue   # I4
+        if i >= lastResultIdx: break                    # I1：最后一条结果及其后不动
+        if not isToolResultMessage(msgs[i]): continue    # 非结果消息不参与区段
+
+        # —— 永久不合格：跳过，不挡游标（否则小额输出会让游标永久停摆）
+        if pinned(msgs[i]):                          continue
+        if absorbed(msgs[i]):                        continue
+        if tokens(msgs[i]) < config.minTokens:       continue
+
+        # —— 暂时不合格：挡住游标（否则就是 FIFO 回退，S 变成整段历史）
+        if not hasUseOpportunity(msgs[i], config):   break
+
         span.push(i)
-    return span 两端连续的一段（中间遇到不可遮的即断开，只取第一段）
+        if span.length >= config.maxSpanPerTurn:     break   # 单轮推进上限
+    return span
 ```
 
-注意 `span` 必须是**连续的**：中间夹着一条不可遮的（pinned 或未收尾），就断开，只遮第一段。这样边界是单调的、可解释的。
+三条实现约束：
+
+1. **区段从前端开始，但中间可以有空洞**。越过一个 pin 项之后继续向后推进是允许的——改动点仍然是 `span[0]`，`S` 仍然是"`span[0]` 之后、上一轮已缓存"的全部内容，跳过中间某一条**不产生额外缓存代价**。v1.1 写的"中间遇到不可遮的即断开"把这件事搞错了：它让一条 pin 或一条小额输出永久冻住整个机制。
+2. **暂时不合格必须 break，不能 continue**。这是 I2 与成本模型的要求，不是风格问题：`continue` 等于"先遮后面、等前面后来合格再补"，那时改动点在前面，`S` 就是中间夹着的整段历史。
+3. **`maxSpanPerTurn` 是安全阀**（默认 8 条）。一个长步骤收尾后可能一次性释放二十几条候选，全遮的话 `S` 会覆盖整个步骤。分两三轮推进的代价是两次 `(w−c)×S`，但每次的 `S` 只有前一次的一半左右，且模型不会一次性失去二十几条证据。
+
+> 关于"步骤收尾才释放"本身的风险：`coverAfter` 信号就是为它准备的。不必等整个步骤 concluded——一条结果后面出现两条新结果，它就已经不是"当前事实"了。这是让 lag-1 保持 lag-1 的关键，否则 step 粒度一粗，机制就退化成 lag-k。
 
 ### 5.4 组装上下文
 
@@ -294,7 +334,11 @@ function assembleContext(leafPath, config):
   "replay": { "kind": "reread", "safe": true, "why": null },
   "full": { "store": "session-jsonl", "offset": 102400, "len": 48213 },
   "stepId": "s3",
-  "conclusionRef": "conc-7",       // I4 的证据：谁引用了它
+  "usedBy": {                      // I4 三信号（至少一个非空，见 §4.1）
+    "decision": "D3",              // 被某条 decision 引用（最强）
+    "stepConcluded": true,         // 所属步骤已收尾
+    "coveredBy": 2                 // 其后新增结果条数（最弱信号）
+  },
   "maskedAt": "2026-10-29T16:00:00+08:00"
 }
 ```
@@ -367,13 +411,16 @@ recall 只在"需要复核证据"时有用，不是"恢复上下文"的手段。
 ```
 ~/.pi/agent/
   sessions/<project>/<session>.jsonl      # pi 的源真相，本机制只读，绝不写
-  ctx/<sessionId>/
+  state/<projectId>/                       # 本插件工作区（路径唯一定义见 interface-contract.md §3）
     masks.jsonl                            # 冻结的遮蔽记录，只追加，一行一条
-    blobs/<entryId>.json                   # 不可重放输出的完整原文
+    blobs/<entryId>.<ext>                  # 不可重放输出的完整原文（持久目录，不是 tmp）
+    blobs/index.jsonl                      # entryId → {kind, bytes, sha, source, createdAt}
     pins.json                              # 用户显式豁免列表
     metrics.jsonl                          # 每轮 token/cache 估算，供评估用
     offsets.json                           # 派生：entryId → {offset,len}，可随时删除重建
 ```
+
+> **v1.2 修正**：v1.1 写的是 `ctx/<sessionId>/`，phase-2 §4.5 写的是 `<sessionTmp>/blobs/`，两处都声称"同一份定义"。实际是两个不同路径，而且后者是临时目录——与 I5「被遮蔽的原文必须仍可取得」直接冲突。现统一到 `state/<projectId>/`，见 `interface-contract.md` §3。2A 的 L2 落盘与 2B 的原文落盘共用这一个目录与这一份索引。
 
 分层原则：
 
@@ -426,12 +473,13 @@ pi 的 session 是树，`/tree` 可在任意节点切分支，`/fork` 可复制�
 | `enabled` | `false` | bool | 总开关。默认关，需显式打开 |
 | `lagTurns` | `1` | 1–2 | 滞后轮数。1 为最小失效范围，不建议改大 |
 | `minTokens` | `1000` | 200–8000 | 绝对下限，小于此体量不遮蔽 |
-| `minRatioOverSuffix` | `4` | 1–20 | `M ≥ ratio × S` 才遮。把"回本几轮"翻译成可执行条件（§2.4）。调大可省缓存、调小可省 token |
+| `minRatioOverSuffix` | `4` | 1–20 | `M ≥ ratio × S` 才遮。**`4` 的真实含义是"回本 ≤ 1.5 轮"**（DeepSeek 口径，见 `interface-contract.md` §4），不是"≤ 4 轮"。调大可省缓存、调小可省 token |
 | `maskBudgetTokens` | `160` | 80–400 | 单块渲染上限；多块 message 按 `160 + 40×(块数−1)` 计，硬上限 320 |
 | `headLines` / `tailLines` | `5` / `5` | 0–20 | 保留的原文行数 |
 | `highlightLimit` | `3` | 0–5 | 关键行上限 |
-| `requireConclusion` | `true` | bool | I4 的开关。**强烈建议保持 true**，关掉等于放弃证据链 |
-| `maxSpanPerTurn` | `∞` | 1–∞ | 一轮最多遮蔽多少条连续 message |
+| `requireUseOpportunity` | `true` | bool | I4 的开关（v1.2 由 `requireConclusion` 改名）。**强烈建议保持 true**，关掉等于放弃证据链 |
+| `coverAfter` | `2` | 1–10 | I4 的第三信号：一条结果之后出现几条新结果即视为"已被覆盖"。调大更保守、推进更慢 |
+| `maxSpanPerTurn` | `8` | 1–∞ | 一轮最多推进多少条，安全阀。设太大会让一个长步骤收尾时一次性移走大量证据 |
 | `pinPatterns` | `[]` | glob 数组 | 路径豁免（如 `**/*.lock`、正在 debug 的文件） |
 | `redactPatterns` | `[]` | regex 数组 | 落盘前脱敏（密钥、token、内网地址） |
 | `storeBlobs` | `true` | bool | 不可重放输出落盘。关掉会失去审计能力，不建议 |
@@ -453,7 +501,7 @@ pi 的 session 是树，`/tree` 可在任意节点切分支，`/fork` 可复制�
 | 末行解析失败 | 进程被杀 | JSON parse 异常 | 丢弃末行；关键写加 fsync |
 | 遮错了时间线的内容 | 决策用了全局游标 | 召回内容与当前分支不符 | 改为按 path 的纯函数（I6） |
 | 同一位置被遮两次 | 冻结查找失败（键用错） | 渲染内容与原文明显不符 | 以 `entryId` 为键；写入前先查重 |
-| 证据消失了但没人用过 | 违反了 I4 | `conclusionRef` 为空却有 mask | 加断言；`requireConclusion` 强制 true |
+| 证据消失了但没人用过 | 违反了 I4 | 三个信号凭据都为空却有 mask | 加断言；`requireUseOpportunity` 强制 true |
 
 ---
 
@@ -482,10 +530,11 @@ pi 的 session 是树，`/tree` 可在任意节点切分支，`/fork` 可复制�
 | `mask_savings` | Σ(M − m) 的累计值 | 越大越好 |
 | `mask_overhead` | Σ m / 总上下文 token | < 15% |
 | `payback_turns` | 每条遮蔽事件的 `n*`（§2.4） | ≤ 3 轮 |
-| `re_read_rate` | 同一 path 重复 read 次数 / 总 read | 增幅 < 20% |
+| `re_read_rate` | 同一 path 重复 read 次数 / 总 read | 绝对值 < 10% **且** 增幅 < 20%（两个都看，基线本身可能已 15%） |
 | `steps_per_task` | 完成任务的平均步数 | 增幅 < 5% |
 | `repeat_error_count` | 同一报错文本重复出现的次数 | 不上升 |
-| `conclusion_coverage` | 有 `conclusionRef` 的 mask / 总 mask | ≈ 100% |
+| `use_opportunity_coverage` | 有任一 I4 信号凭据的 mask / 总 mask | = 100% |
+| `conclusion_coverage` | 有 `conclusionRef`（最强信号）的 mask / 总 mask | 仅观测，不设门槛 |
 | `task_success` / `diff_correctness` | 任务成功率、最终 diff 是否正确 | 不下降 |
 
 ### 13.2 回放脚本（离线，不需调模型）
@@ -541,7 +590,9 @@ M0 必须先做。如果归因显示 token 主要花在"少数几次超大读取
 | 跨会话连续性 | 交接文件（handoff），不是本机制 |
 | 需要全局一致判断的大改动 | 不拆子 agent；在单一上下文里做完 |
 
-依赖关系：本机制依赖**结论先行**（I4）。如果 agent 看完输出不写结论就往下走，遮蔽会在证据未被使用时把它丢掉——那时你连"它当时看到了什么"都说不清。所以状态外部化不是可选优化，是本机制的前置条件。
+依赖关系：本机制依赖**使用机会判定**（I4，见 §4.1）。三个信号里最强的两个来自阶段 3——`decisions.md` 的引用、`plan.md` 的步骤状态；两者都缺席时退回最弱的"被后续结果覆盖"，机制仍能运行，但移出的可解释性下降（无法回答"凭什么当时可以移走"）。
+
+所以阶段 3 仍应先上，但理由变了：**不是因为它让机制"能够工作"，而是因为它让每一次移出"可审计"**。v1.1 把这条写成硬前置，代价是"没有 §3 就完全没有 2B"——现在是一个强弱之分，不是有无之分。
 
 ---
 
@@ -569,14 +620,18 @@ M0 必须先做。如果归因显示 token 主要花在"少数几次超大读取
 2. 同一组输入调用 `computeEligible` 两次，结果集完全相等（I6）
 3. `renderMask` 对同一输入的输出逐字节相等于两次调用（I3/R1-R3）
 4. 已有冻结记录时，即使原文 sha 变化，渲染文本不变（I3）
-5. 未收尾步骤的结果不进 eligible（I4）
+5. 未获得使用机会（三信号皆不满足）的结果不进 eligible，并阻断其后的候选（I4）
 6. 遮蔽后 `recall` 能取回原文（I5）
 7. 遮蔽只替换 content，`tool_use_id` 保留（结构合法性）
 8. 同一 message 内多个 tool_result 整体遮蔽，不拆分
 9. 分支 A 的遮蔽不影响分支 B 的 `computeEligible` 结果（I6）
 10. 末行残缺的 `masks.jsonl` 能正常加载
 11. 并发写检测：第二个写者被拒绝
-12. 关闭开关时，输出与未安装插件时逐字节一致
+12. 关闭开关时，输出与未安装插件时逐字节一致（本机制不改工具集，见 `interface-contract.md` §2）
+13. **永久不合格项不阻塞游标**：构造"大结果 → pin 结果 → 大结果"的序列，第三次调用时后一个大结果仍被遮（v1.2）
+14. **暂时不合格项阻塞游标**：构造"大结果（无使用机会）→ 大结果（已覆盖）"的序列，第二条本轮不被遮（v1.2）
+15. **单轮条数上限**：`maxSpanPerTurn = 8` 时，一次性释放二十条候选，首轮只遮 8 条（v1.2）
+16. **区段空洞不额外计费**：区段中间夹一条 pin 时，`S` 与"无空洞"情形相同（v1.2）
 
 ---
 
@@ -601,3 +656,20 @@ M0 必须先做。如果归因显示 token 主要花在"少数几次超大读取
 | §14 的 go/no-go 方式 | 定性判断 | 改为逐条代入不等式 |
 
 六条不变式（§4）**未改动**。I1–I6 仍是本文的第一性约束。
+
+**v1.2 · 2026-11-02**
+
+| 改动 | 原内容 | 原因 |
+|---|---|---|
+| **I4 降级为"使用机会覆盖"**（§4.1 新增、§5.1 条件 1） | "没有结论引用该证据时，不得遮蔽"，`conclusionRef` 为唯一凭据 | 阶段 3 的 decision 是 per-step（一个步骤一条），而一次探索有十几条结果。按原定义只有被点名的那几条可遮，未点名的永久卡住游标——机制在第 3–5 轮停摆。改判为三信号任一（被引用 / 步骤收尾 / 被后续覆盖），并显式承认这是语义降级 |
+| **`computeEligible` 重写**（§5.3） | `continue` 跳过所有不合格项，返回"遇到不可遮即断开、只取第一段"——两种读法一种是 FIFO 回退（`S` 变整段历史）、一种是永久停摆 | 区分永久不合格（越过）与暂时不合格（挡住）。原规则下一条 pin 或一条小额输出就会冻住整个机制 |
+| 区段允许空洞（§5.3） | "`span` 必须是连续的" | 缓存代价只由最早改动点决定，中间空洞不额外计费。原规则把"顺序不许跳"与"区段必须连续"混为一谈 |
+| 新增 `coverAfter`（§10） | 无 | 让 step 收尾不必等整个步骤 concluded，否则 step 粒度一粗就退化为 lag-k |
+| `maxSpanPerTurn` 默认 `∞ → 8`（§10） | 无上限 | 长步骤收尾时一次性释放二十几条候选，`S` 覆盖整个步骤，且模型一次失去太多证据 |
+| `requireConclusion` → `requireUseOpportunity`（§10） | 原名 | 与新 I4 语义对齐，避免名字暗示"必须有结论" |
+| `minRatioOverSuffix = 4` 的注释修正（§5.1、§10） | 称"对应 DeepSeek 回本 ≤ 4 轮" | 代入公式实际是 1.27–1.48 轮；`n* = 4` 对应 `M ≈ 1.8S + 448`。原注释把门槛说松了 3 倍 |
+| blob 路径统一（§8） | `ctx/<sessionId>/blobs/` | 与 phase-2 的 `<sessionTmp>/blobs/` 冲突，且临时目录会清理、违反 I5。统一到 `state/<projectId>/blobs/` |
+| `re_read_rate` 双门槛（§13.1） | 只看"增幅 < 20%" | 与 phase-1 的"< 10%"冲突；基线与增幅都要看 |
+| 单测 +4 条（§17） | 12 条 | 覆盖新增的三类判定边界 |
+
+**I1、I2、I3、I5、I6 未改动。** 只有 I4 的判据被替换。
