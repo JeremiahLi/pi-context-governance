@@ -34,7 +34,7 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 
 <h1>pi 上下文治理插件 · 总体设计说明</h1>
 <p class="sub">阶段 0–4 全景：框架、原理、能力边界与取舍</p>
-<p class="meta">v1.3 · 2026-11-02 · 配套文档：<code>phase-0</code> ~ <code>phase-3</code>、<code>lag1-masking-design</code>、<code>interface-contract</code>（共享常量与断言的唯一来源）、<code>pi-context-compression-prd-v0.1</code></p>
+<p class="meta">v1.4 · 2026-11-02 · 配套文档：<code>phase-0</code> ~ <code>phase-3</code>、<code>lag1-masking-design</code>、<code>interface-contract</code>（共享常量与断言的唯一来源）、<code>pi-context-compression-prd-v0.1</code></p>
 
 <div class="warn">
 <strong>v1.2 不是加功能，是修接口。</strong>跨文档的共享常量、断言、路径已收敛到 <code>interface-contract.md</code>。此前 v1.1 至少有六处"单份文档内部看着对、接口上加起来错"的矛盾：<code>A7</code> 降级了但阶段 1 的 bash 软上限没跟；<code>§6</code> 改成"边际收益不为零"但 <code>reducedBy</code> 规则仍让 2B 跳过一切被 2A 碰过的消息；总览说注入块不随轮数增长而阶段 3 自己承认 50 轮会到 25k；blob 有两个路径且其中之一在临时目录；"全关逐字节一致"被当成全局不变量；2B 的游标判定按两种读法实现都会失败。<br>
@@ -43,6 +43,10 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 
 <div class="warn">
 <strong>v1.3 修的是 v1.2 自己引入的四处错。</strong>① 2B 的区段代价 <code>S</code> 从"区段第一条之后"改成"区段最后一条之后 + 区段内空洞"，否则被遮蔽的内容会被算两次，<code>Δ</code> 方向翻转（两条各 12k 时从 −2080 变成 +8720）；② <code>minRatioOverSuffix</code> 由 4 改为 1，因为"回本 ≤1.5 轮"会把 4.4 轮回本的明显划算案拒掉；③ <code>interface-contract</code> §6 把刚拆掉的硬前置（"阶段 3 必须先于 2B"）写了回去，与 lag1 §4.1 直接冲突；④ 脱敏被扩到了 <code>read</code>/<code>grep</code> 的源码正文上，会撞坏 <code>edit</code> 的 <code>oldText</code> 匹配。另有写保护只覆盖了 <code>.pi/state/</code> 一个根、<code>re_read_rate</code> 的绝对门槛在基线 15% 时永不可过两处。⑤ <code>recall</code> 一直被当作 2B 的工具描述，但 2A 的 L2 指针与阶段 1 的硬上限截断已经在用它——那两个阶段上线时会渲染出一个调不通的工具名。现在明确 <code>recall</code> 随 2A 上线。
+</div>
+
+<div class="warn">
+<strong>v1.4 只做一件事：把「质量零容忍」从口号变成条款。</strong>账单那条（工具输出不再堆积）v1.3 已经算清楚了；质量那条一直靠一句"I7 兜底"顶着，而 I7 只管「读过没有」，不管「此刻看不看得见」。补上的四块：<strong>①</strong> I7 拆出条款 2——<code>edit</code> 的目标行必须当前可见或已召回，落在遮蔽记录被省略的中段就拒绝并给区间召回；<strong>②</strong> 新增 <strong>I8 · 不盲写</strong>，<code>write</code> 覆盖已存在文件要求全文可见（<code>edit</code> 靠字节匹配兜底，<code>write</code> 没有这层网，1400 行可以静默写没）；<strong>③</strong> 2B 必须与 compaction 竞速，第 1 轮就开，不设预热期；<strong>④</strong> 删掉「任务成功率不下降」——n=20 检不出 5% 的差异，留着只有虚假安心。全开后的质量保证范围见 <a href="#s10">§10.1</a>，它比标题那句硬约束窄，现在写清楚了。
 </div>
 
 
@@ -342,7 +346,16 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 <tr><td>使用机会覆盖</td><td>证据必须已获得使用机会才可移出：被某条 decision 引用、或所属步骤已收尾、或其后已出现 ≥2 条新结果（三信号任一）。只看"有没有被结论点名"会让机制在第 3–5 轮永久停摆</td></tr>
 <tr><td>移出 ≠ 删除</td><td>原文必须仍可取得（JSONL 偏移或 blob），召回只能追加在尾部、不能回填</td></tr>
 <tr><td>决策与渲染分离</td><td>哪些位置该遮由纯函数 <code>f(path, config)</code> 决定（天然支持分支与崩溃恢复），遮什么由一次性冻结决定（保证确定性与缓存友好）</td></tr>
+<tr><td><strong>必须跑赢 compaction</strong></td><td>两者都在压缩上下文，但可逆性相反：2B 移出可 <code>recall</code>，compaction 是有损摘要、字面量先死。2B 慢一步，原文就被摘要吃掉——质量损失恰好来自本方案拒绝当主力的那条路。所以<strong>不设预热期，第 1 轮就开</strong>；指标 <code>pre_compaction_mask_rate &lt; 5%</code></td></tr>
 </table>
+
+<div class="warn">
+<strong>还有两道输入侧闸门，容易被漏掉（v1.4）。</strong>上面五条管的是输出侧保真；模型这一侧还需要两条：
+<ul style="margin:8px 0 0">
+<li><strong>I7 · 不盲改</strong>：<code>edit</code> 的 <code>oldText</code> 既要<em>读过</em>（ledger + sha），也要<strong>此刻看得见</strong>——落在遮蔽记录被省略的中段就得先按区间 <code>recall</code>。只有前者时，"读过 → 被移出 → 直接改中段"这条路既不涨 <code>re_read_rate</code> 也不计 <code>needed_but_removed</code>，两条质量指标同时沉默。</li>
+<li><strong>I8 · 不盲写</strong>：<code>write</code> 覆盖已存在文件时，要求全文当前可见或已召回。<code>edit</code> 至少需要能匹配的 <code>oldText</code>，字节错了会失败；<code>write</code> 不需要——模型凭 head/tail 拼一份内容写回去，1400 行可以静默蒸发。<strong>这是比 I7 更大的洞</strong>（phase-1 §9.5）。</li>
+</ul>
+</div>
 
 <h3>5.4 时序：为什么是"滞后一轮"</h3>
 <p>因为它正好夹在"观察到"与"再次需要"之间，是这个间隔的最小值。代价公式为：</p>
@@ -555,14 +568,24 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 
 <p>下表是量级估算（基于典型 coding 会话、工具输出占 50–70% 的假设），<strong>不是实测值</strong>，必须用阶段 0 在你自己的 session 上校准。</p>
 
+<div class="warn">
+<strong>这张表里混着两类完全不同的收益，不能相加、也不能互相替代（v1.4 拆开）。</strong>
+<table style="margin-top:10px">
+<tr><th style="width:210px">目标</th><th style="width:170px">谁在扛</th><th>不开质量口子能不能做到</th></tr>
+<tr><td><strong>账单类</strong>：输入不再随工具输出线性涨，延迟与成本稳住</td><td>2B，辅以 2A 的噪声清洗</td><td>能。这是这套方案真正算清楚的部分</td></tr>
+<tr><td><strong>可靠性类</strong>：后面不忘约束、不把早期错误判断当成事实、改代码仍基于原文</td><td>阶段 3，加上 I7 / I8 的可见性闸门</td><td>只对<strong>写进状态文件的那部分</strong>，且<strong>目标行仍可见</strong>时成立</td></tr>
+</table>
+<p style="margin:10px 0 0">总览估的「长会话 −40~60%」全部来自第一行，前提是工具输出占上下文一半到七成。阶段 3 几乎不省 token，它买的是可靠性。<strong>别拿账单的下降去论证可靠性的达标</strong>——它们是两笔账。</p>
+</div>
+
 <table>
 <tr><th style="width:150px">机制</th><th style="width:190px">主要收益</th><th style="width:150px">量级（估算）</th><th>代价与风险</th></tr>
 <tr><td>阶段 1（无损部分）</td><td>重复读抑制、拒读、规模头、grep 小额直返</td><td>总量 −5~10%</td><td>几乎无；收益有限，但零风险</td></tr>
 <tr><td>阶段 1（视图改动）</td><td>大文件返大纲</td><td><code>tokens_per_locate</code> −50%（仅定位型与 &gt;1500 行文件）</td><td>大纲质量需持续维护；步数 +1；须先过影子模式</td></tr>
 <tr><td>2A</td><td>削掉噪声与超限输出</td><td>总量 −5~15%</td><td>L2 变换靠 blob 回溯；落盘泄漏面</td></tr>
-<tr><td>2B</td><td>停止累积增长</td><td>长会话 −40~60%</td><td><code>w·m + (w−c)·S</code> 一次性代价；行为风险（可能增加重读）</td></tr>
-<tr><td>阶段 3</td><td>可靠性、可恢复、抗虚报</td><td>非 token 收益</td><td>5–6 天 + 长期维护；状态漂移风险</td></tr>
-<tr><td>阶段 4</td><td>隔离宽而浅的探索</td><td>主上下文 −20~40%</td><td>固定开销、跨 session 调试成本、错误传播</td></tr>
+<tr><td>2B</td><td>停止累积增长</td><td>长会话 −40~60%</td><td><code>w·m + (w−c)·S</code> 一次性代价；行为风险（可能增加重读）；<strong>必须与 compaction 竞速</strong></td></tr>
+<tr><td>阶段 3</td><td>可靠性、可恢复、抗虚报</td><td><strong>非 token 收益</strong></td><td>5–6 天 + 长期维护；状态漂移风险</td></tr>
+<tr><td>阶段 4</td><td>隔离宽而浅的探索</td><td>主上下文 −20~40%</td><td>固定开销、跨 session 调试成本；错误传播</td></tr>
 </table>
 
 <div class="key">
@@ -580,6 +603,17 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 <li><strong>不解决跨会话记忆。</strong>那需要另一套存储与检索，明确不在范围内。</li>
 <li><strong>不对短会话划算。</strong>回本曲线决定了 ≤10 轮的任务基本无感，甚至略亏。</li>
 </ul>
+
+<div class="bad">
+<strong>「质量零容忍」这句话的真实边界（v1.4 补）。</strong>它是设计约束，不是全机制开启后的保证。全开时可保证的是这四件事，且只到这四件：
+<ol style="margin:10px 0 6px">
+<li>命令输出被移走，但原文可 `recall`，且移走时间点由 I4 三信号约束；</li>
+<li>代码被改的那一刻，<strong>目标行的字节仍在上下文里或是刚召回的</strong>（I7 条款 2）——不是"整份文件都在"；</li>
+<li>对已存在文件的整文件覆盖，要求全文当前可见（I8）；</li>
+<li>约束与判断进了状态文件的，跨会话不忘；没进文件的那句，仍然会沉到上下文中段被 compaction 吃掉。</li>
+</ol>
+<p style="margin:10px 0 0">边界之外还有三条已知损失，它们不因为"I7 兜底"而消失：<strong>①</strong> 2B 跑不赢 compaction 时，原文被摘要吃掉（不可逆，<code>pre_compaction_mask_rate</code> 度量）；<strong>②</strong> 结论留在历史、依据被移走，认识论上偏向主张（<code>orphan_conclusion_rate</code> 度量，只能止损）；<strong>③</strong> 遮蔽后编辑中段会触发一次区间召回，这是拿回正确性的价格，不是免费的。</p>
+</div>
 
 <h3>10.2 风险清单</h3>
 <table>
