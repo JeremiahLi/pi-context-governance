@@ -34,19 +34,16 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 
 <h1>pi 上下文治理插件 · 总体设计说明</h1>
 <p class="sub">阶段 0–4 全景：框架、原理、能力边界与取舍</p>
-<p class="meta">v1.0 · 2026-10-30 · 配套文档：<code>phase-0</code> ~ <code>phase-3</code>、<code>lag1-masking-design</code>、<code>pi-context-compression-prd-v0.1</code></p>
+<p class="meta">v1.1 · 2026-11-02 · 配套文档：<code>phase-0</code> ~ <code>phase-3</code>、<code>lag1-masking-design</code>、<code>pi-context-compression-prd-v0.1</code></p>
 
-<div class="warn">
-<strong>已修订（2026-11-02）：</strong>本页的阶段顺序、成本倍率与阶段 1 的默认阈值以 <code>adr-0001-quality-first-defaults.md</code> 为准。要点：新顺序为 <strong>0 → 2A（仅无损）→ 3 → 2B → 1 → 4</strong>；阶段 1 的 outline 默认阈值由 300 行改为 1500 行；成本模型需按 provider 参数化（本项目跑 OpenAI / DeepSeek，无缓存写入溢价）；2C 已删除。第 8 节的路线图与本文冲突时以 ADR 为准。
-</div>
 
 <div class="toc">
 <div><a href="#s0">0 · 一页速览</a></div>
 <div><a href="#s1">1 · 为什么做，以及不做什么</a></div>
-<div><a href="#s2">2 · 全景架构：一条上下文进入模型前的四道工序</a></div>
+<div><a href="#s2">2 · 全景架构：一条上下文进入模型前的三道工序</a></div>
 <div><a href="#s3">3 · 阶段 0 · 度量与归因</a></div>
 <div><a href="#s4">4 · 阶段 1 · 读取纪律</a></div>
-<div><a href="#s5">5 · 阶段 2 · 削减与移出（2A / 2B / 2C）</a></div>
+<div><a href="#s5">5 · 阶段 2 · 削减与移出（2A / 2B）</a></div>
 <div><a href="#s6">6 · 阶段 3 · 状态外部化</a></div>
 <div><a href="#s7">7 · 阶段 4 · 子 agent 隔离</a></div>
 <div><a href="#s8">8 · 实施路线与决策点</a></div>
@@ -60,15 +57,14 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 
 <p>上下文的一生有四个可以动手的位置，加上两个旁路机制，就是这个插件的全部：</p>
 
-<p><strong>不产生 → 少进来 → 削一刀 → 移出去 → 记下来（+ 隔离）</strong></p>
+<p><strong>少进来（无损）→ 记下来 → 移出去 → 早一点不给 → 隔离</strong></p>
 
 <table>
 <tr><th style="width:92px">阶段</th><th style="width:150px">一句话</th><th style="width:104px">作用位置</th><th>主要产出</th><th style="width:74px">状态</th></tr>
 <tr><td><b>0 度量</b></td><td>先知道 token 花在哪</td><td>观测（旁路）</td><td>token 归因报告、遮蔽收益模拟、判定结论</td><td>前置，必做</td></tr>
 <tr><td><b>1 读取纪律</b></td><td>用工具契约决定"拿多少"</td><td>请求发生前</td><td>read / grep / bash / ls 的契约与阈值</td><td>必做</td></tr>
 <tr><td><b>2A 入口削减</b></td><td>进来的东西先削一遍</td><td>写入上下文前</td><td>8 条确定性清洗规则 + 中部扫描 + 落盘</td><td>必做</td></tr>
-<tr><td><b>2B 出口移出</b></td><td>看过之后把历史移出去</td><td>下一轮组装时</td><td>lag-1 遮蔽、偏移索引、recall</td><td><b>条件性</b></td></tr>
-<tr><td><b>2C 非工具内容</b></td><td>thinking 与重复文本</td><td>低频（compaction 时刻）</td><td>provider 能力表、清理策略</td><td>可选</td></tr>
+<tr><td><b>2B 出口移出</b></td><td>看过之后把历史移出去</td><td>下一轮组装时</td><td>lag-1 遮蔽、偏移索引、recall</td><td><b>按不等式决定</b></td></tr>
 <tr><td><b>3 状态外部化</b></td><td>该记的记到文件</td><td>旁路（尾部注入）</td><td><code>.pi/state/</code>：计划 / 事实 / 判断 / 约束 / 交接</td><td>长期价值最高</td></tr>
 <tr><td><b>4 子 agent</b></td><td>不该主线程看的别拿进来</td><td>上下文边界</td><td>契约化返回（结论 + 证据指针）</td><td>最后做</td></tr>
 </table>
@@ -77,7 +73,7 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 <strong>三条贯穿全局的判断：</strong><br>
 ① 压缩作为<em>质量手段</em>被高估（模型升级会带走它的价值），作为<em>成本手段</em>成立但排在最后。<br>
 ② 上下文的可靠性不能靠"记得"，只能靠"写下来 + 能校验"。<br>
-③ 便宜的机制先做：不产生 &gt; 少进来 &gt; 削一刀 &gt; 移出去。
+③ 先做不改变"模型看到什么"的机制：无损削减 &gt; 状态外部化 &gt; 移出去 &gt; 提前少给。
 </div>
 
 <h2 id="s1">1 · 为什么做，以及不做什么</h2>
@@ -172,12 +168,11 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 <p class="cap">图 1 · 一条上下文进入模型前的完整链路。四个实心阶段是主链，两个旁路是度量与隔离。</p>
 </div>
 
-<h3>2.1 四道工序的顺序不可调换</h3>
+<h3>2.1 三道工序的顺序不可调换</h3>
 
 <table>
 <tr><th style="width:120px">顺序</th><th>为什么必须是这个顺序</th></tr>
 <tr><td>pi compaction 先</td><td>压缩之后才知道哪些消息还在上下文里，后面的工序都在它的结果上工作</td></tr>
-<tr><td>2C → 2B</td><td>2C 会改写消息内容。先遮蔽再清理，两者会互相踩：被清理的那条可能正好是被遮蔽的那条</td></tr>
 <tr><td>2A 最后</td><td>2A 只作用于最新一条。它的结果会成为下一轮 2B 的处理对象（这也决定了二者的收益关系，见 §9）</td></tr>
 </table>
 
@@ -271,30 +266,30 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 <path d="M 440 88 L 440 116 L 720 116 L 720 140" fill="none" stroke="#8A8880" stroke-width="1.5" marker-end="url(#b)"/>
 
 <rect x="40" y="144" width="240" height="66" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
-<text x="160" y="168" text-anchor="middle" font-size="13" font-weight="600" fill="#085041">≤ 300 行</text>
+<text x="160" y="168" text-anchor="middle" font-size="13" font-weight="600" fill="#085041">≤ 1500 行</text>
 <text x="160" y="188" text-anchor="middle" font-size="11.5" fill="#0F6E56">直接返回全文</text>
 <text x="160" y="238" text-anchor="middle" font-size="11" fill="#75736C">看完即可 edit，零额外步数</text>
 
 <rect x="320" y="144" width="240" height="66" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
-<text x="440" y="168" text-anchor="middle" font-size="13" font-weight="600" fill="#085041">300 – 1500 行</text>
-<text x="440" y="188" text-anchor="middle" font-size="11.5" fill="#0F6E56">返回符号大纲 + 行号索引</text>
+<text x="440" y="168" text-anchor="middle" font-size="13" font-weight="600" fill="#085041">1500 – 20000 行</text>
+<text x="440" y="188" text-anchor="middle" font-size="11.5" fill="#0F6E56">返回符号大纲（full:true 可覆盖）</text>
 <text x="440" y="238" text-anchor="middle" font-size="11" fill="#75736C">按大纲定位，再用 range 取块</text>
 
 <rect x="600" y="144" width="240" height="66" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5" stroke-dasharray="5 4"/>
-<text x="720" y="168" text-anchor="middle" font-size="13" font-weight="600" fill="#085041">&gt; 1500 行</text>
-<text x="720" y="188" text-anchor="middle" font-size="11.5" fill="#0F6E56">强制大纲，拒绝全文</text>
+<text x="720" y="168" text-anchor="middle" font-size="13" font-weight="600" fill="#085041">&gt; 20000 行</text>
+<text x="720" y="188" text-anchor="middle" font-size="11.5" fill="#0F6E56">只给大纲，禁用 full:true</text>
 <text x="720" y="238" text-anchor="middle" font-size="11" fill="#75736C">必须用 range 指定区间</text>
 
 <text x="40" y="282" font-size="12" fill="#5F5E5A">全局视图保留显式通道 full:true —— 砍掉它，重构类任务会退化成局部正确的错误修补。</text>
 </svg>
-<p class="cap">图 3 · read 的三分支。纪律不靠提示词，靠默认行为。</p>
+<p class="cap">图 3 · read 的三分支。阈值上调到 1500 行之后，大纲只用于"全文读进来本身有害"的区间，不再用来省中小文件的 token。</p>
 </div>
 
 <h3>4.2 能力</h3>
 <table>
 <tr><th style="width:110px">工具</th><th>契约要点</th></tr>
-<tr><td><code>read</code></td><td>三分支；行号前缀 <code>123| </code>（需明确声明不要复制进 edit 的 oldText）；同 path+sha+range 在 5 轮内重复则只回一句提示；生成文件/二进制/minified 直接拒读</td></tr>
-<tr><td><code>grep</code></td><td>默认返回聚合计数（每文件命中数），不返回行；展开时 <code>context=2</code>，命中文件数 &gt; 20 只回 top 20</td></tr>
+<tr><td><code>read</code></td><td>三分支（≤1500 行全文 / 1500–20000 大纲 / &gt;20000 只给大纲）；首行带规模头 <code>842 lines · 24 symbols · sha</code>；行号前缀 <code>123| </code>（需明确声明不要复制进 edit 的 oldText）；同 path+sha+range 在 5 轮内重复则只回一句提示；生成文件/二进制/minified 直接拒读</td></tr>
+<tr><td><code>grep</code></td><td>命中 ≤15 条或估算 &lt;2k token 时直接返行；否则返聚合计数（每文件命中数）。展开时 <code>context=2</code>，命中文件数 &gt; 20 只回 top 20</td></tr>
 <tr><td><code>bash</code></td><td>软上限 200 行/8KB → head 80 + tail 40 + 落盘；硬上限 2000 行/200KB</td></tr>
 <tr><td><code>ls</code>/<code>glob</code></td><td>默认只列一层；条目 &gt; 50 折叠；始终忽略 <code>node_modules</code>/<code>dist</code> 等</td></tr>
 <tr><td><code>edit</code>/<code>write</code></td><td>只回 changed hunks 与统计，<strong>不自动回读</strong>（回读是最常见的双倍开支）</td></tr>
@@ -309,14 +304,13 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 
 <h2 id="s5">5 · 阶段 2 · 削减与移出</h2>
 
-<p><span class="tag">2A 必做</span><span class="tag">2B 条件性</span><span class="tag">2C 可选</span></p>
+<p><span class="tag">2A 必做</span><span class="tag">2B 按不等式决定</span></p>
 
-<h3>5.1 三块的分工</h3>
+<h3>5.1 两块的分工</h3>
 <table>
 <tr><th style="width:110px">子块</th><th style="width:170px">作用域</th><th style="width:120px">时点</th><th>缓存代价</th></tr>
 <tr><td><b>2A 入口削减</b></td><td>最新一条工具结果</td><td>写入上下文前</td><td><strong>零</strong>（从未付过钱）</td></tr>
-<tr><td><b>2B 出口移出</b></td><td>历史工具结果</td><td>已观察之后的下一轮</td><td><code>1.15·S</code></td></tr>
-<tr><td><b>2C 非工具内容</b></td><td>thinking / 重复文本</td><td>低频（compaction 时刻）</td><td>一次性全量</td></tr>
+<tr><td><b>2B 出口移出</b></td><td>历史工具结果</td><td>已观察之后的下一轮</td><td><code>w·m + (w−c)·S</code></td></tr>
 </table>
 
 <div class="key">
@@ -342,34 +336,34 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 
 <h3>5.4 时序：为什么是"滞后一轮"</h3>
 <p>因为它正好夹在"观察到"与"再次需要"之间，是这个间隔的最小值。代价公式为：</p>
-<p style="text-align:center;font-size:15px;margin:18px 0"><code>Δ = 1.15·S + 1.25·m − 0.1·M</code>　，<code>S</code> = 改动点之后的内容</p>
-<p>当 <code>S ≈ 2k</code>（一个回合）时，12k 的输出约 1 轮回本；当 <code>S ≈ 30k</code>（改了 20 轮前那条）时，代价高一个数量级。所以 lag-1 不是"稍微好一点"，它就是这个方案能成立的唯一原因。</p>
+<p style="text-align:center;font-size:15px;margin:18px 0"><code>Δ = w·m + (w−c)·S − c·M</code>　，OpenAI <code>c=0.5, w=1.0</code>、DeepSeek <code>c=0.1, w=1.0</code>；<code>S</code> = 改动点之后、上一轮已进入缓存的内容（不含本轮新增）</p>
+<p>当 <code>S ≈ 2k</code>（一个回合）时，12k 的输出约 0.6–1 轮回本（OpenAI 侧立赚）；当 <code>S ≈ 30k</code>（改了 20 轮前那条）时，代价高一个数量级。所以 lag-1 不是"稍微好一点"，它就是这个方案能成立的唯一原因。</p>
 
-<h3>5.5 收益上限（会改变实施顺序的结论）</h3>
+<h3>5.5 边际收益变小，但不为零（v1.1 修正）</h3>
 
 <div class="fig">
-<svg viewBox="0 0 880 290" width="100%" role="img">
-<title>2A 与 2B 的收益不叠加</title>
-<desc>同一份十二 k 输出，只做 2B 可压到一百六十，先做 2A 后停在两千，此时 2B 无事可做。</desc>
-<text x="40" y="46" font-size="12.5" fill="#5F5E5A">原始：单次 read 12k token</text>
-<rect x="40" y="54" width="640" height="32" rx="6" fill="#F1EFE8" stroke="#8A8880" stroke-width=".5"/>
-<text x="696" y="75" font-size="12" fill="#5F5E5A">12k</text>
+<svg viewBox="0 0 880 250" width="100%" role="img">
+<title>2A 与 2B 的收益关系</title>
+<desc>2A 把十二 k 压到两千，2B 再压到两百；边际收益从十一 k 降到一点八 k，但不为零。</desc>
+<text x="40" y="40" font-size="12.5" fill="#5F5E5A">原始：单次 read 12k token</text>
+<rect x="40" y="48" width="700" height="28" rx="6" fill="#F1EFE8" stroke="#8A8880" stroke-width=".5"/>
+<text x="756" y="67" font-size="12" fill="#5F5E5A">12k</text>
 
-<text x="40" y="120" font-size="12.5" fill="#5F5E5A">过 2A：head / tail + 中部扫描</text>
-<rect x="40" y="128" width="107" height="32" rx="6" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
-<text x="163" y="149" font-size="12" fill="#0F6E56">2k</text>
+<text x="40" y="108" font-size="12.5" fill="#5F5E5A">过 2A（仅无损 + 紧急硬上限）：视内容而定，乐观情形约 2k</text>
+<rect x="40" y="116" width="117" height="28" rx="6" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
+<text x="173" y="135" font-size="12" fill="#0F6E56">2k</text>
 
-<text x="40" y="194" font-size="12.5" fill="#5F5E5A">再过 2B：已被 2A 削过，跳过</text>
-<rect x="40" y="202" width="107" height="32" rx="6" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5" stroke-dasharray="5 4"/>
-<text x="163" y="223" font-size="12" fill="#0F6E56">2k（不变）</text>
+<text x="40" y="176" font-size="12.5" fill="#5F5E5A">再过 2B：约 200 —— 边际收益 1.8k / 条 / 轮</text>
+<rect x="40" y="184" width="13" height="28" rx="3" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
+<text x="69" y="203" font-size="12" fill="#0F6E56">200</text>
 
-<text x="40" y="266" font-size="12" fill="#5F5E5A">只做 2B 能到 160；先做 2A 就只能停在 2k，2B 付了缓存代价却无事可做。收益取上限，不相加。</text>
+<text x="40" y="232" font-size="12" fill="#5F5E5A">v1.0 由此断言"2B 无事可做"——错了：1.8k × 存量条数 × 剩余轮数，是一笔持续节省。</text>
 </svg>
-<p class="cap">图 4 · 所以实施顺序是先 2A、量 p90，再决定 2B 要不要建。</p>
+<p class="cap">图 4 · 边际收益变小不等于消失。判它划不划算要用不等式，不能用形容词。</p>
 </div>
 
 <div class="warn">
-<strong>这条结论会改变你的实施计划。</strong>2A 把 p90 的单次输出压到 2k 以下时，2B 的主要收益来源就消失了。为此设了一条硬规则「削减幂等性」：被 2A 处理过的消息打标记，2B 跳过；<code>double_reduced_count</code> 必须为 0（这是正确性断言，不是优化指标）。
+<strong>判据（v1.1 修正）：</strong><code>c·(M−m)·(R−t) &gt; w·m + (w−c)·S</code>，即"剩余轮数的累计节省"要大于"这一刀的一次性代价"。按对 2B 最不利的 <code>M=2k, m=160, S=2k</code> 代入：DeepSeek 需剩余 &gt;11 轮，OpenAI 需剩余 &gt;2 轮；<code>M=12k</code> 时 DeepSeek 只需 &gt;2 轮。<strong>决策变量是会话还剩多少轮，不是 2A 有多强。</strong>「削减幂等性」仍然保留：被 2A 削减过的消息打标记，2B 不重复削，<code>double_reduced_count</code> 必须为 0。
 </div>
 
 <h2 id="s6">6 · 阶段 3 · 状态外部化</h2>
@@ -494,46 +488,46 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 <div class="fig">
 <svg viewBox="0 0 880 260" width="100%" role="img">
 <title>实施路线</title>
-<desc>从度量到子 agent 隔离的推进顺序，中间有一个决定是否做 2B 的决策点。</desc>
+<desc>按质量风险排序的推进顺序：先做不改变模型所见的机制。</desc>
 <defs><marker id="e" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#8A8880" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
-<rect x="34" y="118" width="106" height="58" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width=".5"/>
-<text x="87" y="142" text-anchor="middle" font-size="12.5" font-weight="600" fill="#0C447C">0 度量</text>
-<text x="87" y="160" text-anchor="middle" font-size="10.5" fill="#185FA5">1 天</text>
-<line x1="142" y1="147" x2="168" y2="147" stroke="#8A8880" stroke-width="1.5" marker-end="url(#e)"/>
-<rect x="172" y="118" width="106" height="58" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width=".5"/>
-<text x="225" y="142" text-anchor="middle" font-size="12.5" font-weight="600" fill="#0C447C">1 读取纪律</text>
-<text x="225" y="160" text-anchor="middle" font-size="10.5" fill="#185FA5">4 个半天</text>
-<line x1="280" y1="147" x2="306" y2="147" stroke="#8A8880" stroke-width="1.5" marker-end="url(#e)"/>
-<rect x="310" y="118" width="106" height="58" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
-<text x="363" y="142" text-anchor="middle" font-size="12.5" font-weight="600" fill="#085041">2A 削减</text>
-<text x="363" y="160" text-anchor="middle" font-size="10.5" fill="#0F6E56">必做</text>
-<line x1="418" y1="147" x2="470" y2="147" stroke="#8A8880" stroke-width="1.5" marker-end="url(#e)"/>
+<rect x="26" y="118" width="112" height="58" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width=".5"/>
+<text x="82" y="142" text-anchor="middle" font-size="12.5" font-weight="600" fill="#0C447C">0 度量</text>
+<text x="82" y="160" text-anchor="middle" font-size="10.5" fill="#185FA5">1 天</text>
+<line x1="138" y1="147" x2="162" y2="147" stroke="#8A8880" stroke-width="1.5" marker-end="url(#e)"/>
 
-<path d="M 494 126 L 518 147 L 494 168 L 470 147 Z" fill="#FAEEDA" stroke="#BA7517" stroke-width=".5"/>
-<text x="494" y="151" text-anchor="middle" font-size="10.5" fill="#854F0B">p90?</text>
+<rect x="166" y="118" width="112" height="58" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
+<text x="222" y="142" text-anchor="middle" font-size="12.5" font-weight="600" fill="#085041">2A 削减</text>
+<text x="222" y="160" text-anchor="middle" font-size="10.5" fill="#0F6E56">仅无损部分</text>
+<line x1="278" y1="147" x2="302" y2="147" stroke="#8A8880" stroke-width="1.5" marker-end="url(#e)"/>
 
-<path d="M 494 126 L 494 84 L 566 84" fill="none" stroke="#BA7517" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#e)"/>
-<rect x="570" y="58" width="130" height="52" rx="8" fill="#FAEEDA" stroke="#BA7517" stroke-width=".5" stroke-dasharray="4 3"/>
-<text x="635" y="80" text-anchor="middle" font-size="11.5" font-weight="600" fill="#854F0B">2B 移出</text>
-<text x="635" y="97" text-anchor="middle" font-size="10.5" fill="#BA7517">仅当 p90 &gt; 2k</text>
+<rect x="306" y="118" width="112" height="58" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
+<text x="362" y="142" text-anchor="middle" font-size="12.5" font-weight="600" fill="#085041">3 状态</text>
+<text x="362" y="160" text-anchor="middle" font-size="10.5" fill="#0F6E56">5–6 天</text>
+<line x1="418" y1="147" x2="442" y2="147" stroke="#BA7517" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#e)"/>
 
-<line x1="518" y1="147" x2="540" y2="147" stroke="#8A8880" stroke-width="1.5" marker-end="url(#e)"/>
-<rect x="544" y="118" width="106" height="58" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width=".5"/>
-<text x="597" y="142" text-anchor="middle" font-size="12.5" font-weight="600" fill="#085041">3 状态</text>
-<text x="597" y="160" text-anchor="middle" font-size="10.5" fill="#0F6E56">5–6 天</text>
-<line x1="652" y1="147" x2="678" y2="147" stroke="#8A8880" stroke-width="1.5" marker-end="url(#e)"/>
-<rect x="682" y="118" width="106" height="58" rx="8" fill="#F1EFE8" stroke="#8A8880" stroke-width=".5"/>
-<text x="735" y="142" text-anchor="middle" font-size="12.5" font-weight="600" fill="#2C2C2A">4 子 agent</text>
-<text x="735" y="160" text-anchor="middle" font-size="10.5" fill="#5F5E5A">最后</text>
+<rect x="446" y="118" width="112" height="58" rx="8" fill="#FAEEDA" stroke="#BA7517" stroke-width=".5" stroke-dasharray="4 3"/>
+<text x="502" y="142" text-anchor="middle" font-size="12.5" font-weight="600" fill="#854F0B">2B 移出</text>
+<text x="502" y="160" text-anchor="middle" font-size="10.5" fill="#BA7517">按不等式判</text>
+<line x1="558" y1="147" x2="582" y2="147" stroke="#8A8880" stroke-width="1.5" marker-end="url(#e)"/>
 
-<text x="34" y="212" font-size="11.5" fill="#5F5E5A">两个 go/no-go 点：① 阶段 1 第一步——pi 能否覆盖原生工具（不能则退化为提示词，应直接跳 2A）；</text>
-<text x="34" y="234" font-size="11.5" fill="#5F5E5A">② 2A 之后——若 p90 单次输出已低于 2k，2B 不值建，直接进阶段 3。</text>
+<rect x="586" y="118" width="112" height="58" rx="8" fill="#F1EFE8" stroke="#8A8880" stroke-width=".5" stroke-dasharray="4 3"/>
+<text x="642" y="142" text-anchor="middle" font-size="12.5" font-weight="600" fill="#2C2C2A">1 读取纪律</text>
+<text x="642" y="160" text-anchor="middle" font-size="10.5" fill="#5F5E5A">影子先行</text>
+<line x1="698" y1="147" x2="722" y2="147" stroke="#8A8880" stroke-width="1.5" marker-end="url(#e)"/>
+
+<rect x="726" y="118" width="112" height="58" rx="8" fill="#F1EFE8" stroke="#8A8880" stroke-width=".5"/>
+<text x="782" y="142" text-anchor="middle" font-size="12.5" font-weight="600" fill="#2C2C2A">4 子 agent</text>
+<text x="782" y="160" text-anchor="middle" font-size="10.5" fill="#5F5E5A">最后</text>
+
+<text x="26" y="206" font-size="11.5" fill="#5F5E5A">排序依据是质量风险，不是省 token 的多少：先做不改变"模型看到什么"的机制。</text>
+<text x="26" y="228" font-size="11.5" fill="#5F5E5A">两个 go/no-go：① Day 0 平台探针（能否改写历史消息 → 决定 2B；能否尾部注入并移除 → 决定阶段 3）；</text>
+<text x="26" y="250" font-size="11.5" fill="#5F5E5A">② 阶段 3 之后按不等式判 2B —— 判据是"会话还剩多少轮"，不是"2A 有多强"。</text>
 </svg>
-<p class="cap">图 7 · 2B 被画成虚线，因为它取决于实测数据，不取决于计划。</p>
+<p class="cap">图 7 · 顺序按质量风险排。2B 与阶段 1 的视图改动画成虚线，两者都取决于实测数据，不取决于计划。</p>
 </div>
 
 <div class="bad">
-<strong>整套方案有一个共同的技术前提尚未验证：</strong>pi 的扩展能否覆盖原生工具、能否在组装层改写消息历史。这个不确认，阶段 1 和 2A 的收益都建立在一个假设上，2B 则完全无从谈起。<strong>验证它只要半天，应该排在所有实现之前。</strong>
+<strong>整套方案有一个共同的技术前提尚未验证：</strong>pi 的扩展能否注册/覆盖工具、能否在组装层改写消息历史、能否在尾部注入并移除上一轮注入块。<strong>这三件事决定哪些机制存在</strong>——改写历史是 2B 的前提，尾部注入与移除是阶段 3 的前提。<strong>验证只要半天，必须排在所有实现之前（Day 0）。</strong>
 </div>
 
 <h2 id="s9">9 · 收益构成与代价</h2>
@@ -542,15 +536,18 @@ code{background:#F1EFE8;padding:1px 5px;border-radius:3px;font-size:12.5px;font-
 
 <table>
 <tr><th style="width:150px">机制</th><th style="width:190px">主要收益</th><th style="width:150px">量级（估算）</th><th>代价与风险</th></tr>
-<tr><td>阶段 1</td><td>减少单次读取</td><td><code>tokens_per_locate</code> −50%</td><td>大纲质量需持续维护；步数 +1</td></tr>
-<tr><td>2A</td><td>削掉超限输出与噪声</td><td>总量 −15~30%</td><td>中部信息风险（靠中部扫描兜）；落盘泄漏面</td></tr>
-<tr><td>2B</td><td>停止累积增长</td><td>长会话 −40~60%</td><td><code>1.15·S</code> 一次性代价；行为风险（可能增加重读）</td></tr>
+<tr><td>阶段 1（无损部分）</td><td>重复读抑制、拒读、规模头、grep 小额直返</td><td>总量 −5~10%</td><td>几乎无；收益有限，但零风险</td></tr>
+<tr><td>阶段 1（视图改动）</td><td>大文件返大纲</td><td><code>tokens_per_locate</code> −50%（仅定位型与 &gt;1500 行文件）</td><td>大纲质量需持续维护；步数 +1；须先过影子模式</td></tr>
+<tr><td>2A</td><td>削掉噪声与超限输出</td><td>总量 −5~15%</td><td>L2 变换靠 blob 回溯；落盘泄漏面</td></tr>
+<tr><td>2B</td><td>停止累积增长</td><td>长会话 −40~60%</td><td><code>w·m + (w−c)·S</code> 一次性代价；行为风险（可能增加重读）</td></tr>
 <tr><td>阶段 3</td><td>可靠性、可恢复、抗虚报</td><td>非 token 收益</td><td>5–6 天 + 长期维护；状态漂移风险</td></tr>
 <tr><td>阶段 4</td><td>隔离宽而浅的探索</td><td>主上下文 −20~40%</td><td>固定开销、跨 session 调试成本、错误传播</td></tr>
 </table>
 
 <div class="key">
-<strong>顺序的经济学：</strong>不产生（阶段 1）→ 少进来（2A）→ 移出去（2B）→ 记下来（阶段 3）。越靠前越便宜，越靠前越不依赖模型能力，也越不依赖 pi 扩展的钩子能力。所以哪怕整个插件只做了阶段 1 和 2A，也已经拿到大部分成本收益。
+<strong>顺序的经济学（v1.1 重写）：</strong>旧版按"越靠前越便宜"排，得到 不产生 &gt; 少进来 &gt; 削一刀 &gt; 移出去。在质量零容忍的前提下，这个排序要改：<strong>凡是改变"模型看到什么"的机制都往后放</strong>。新顺序是 少进来（2A 无损）→ 记下来（阶段 3）→ 移出去（2B）→ 早一点不给（阶段 1 视图改动）。
+
+关键判断：<strong>阶段 1（读时少给）与 2B（读后拿走）的 token 收益高度重叠，但质量风险差一个量级</strong>——后者模型已经看过全文，前者没有。所以同样一块收益，应该交给 2B，而不是压给阈值。这也是为什么 2A 的日常截断被降级为紧急制动。
 </div>
 
 <h2 id="s10">10 · 能力边界、风险与术语</h2>

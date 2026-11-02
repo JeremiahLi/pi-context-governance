@@ -1,11 +1,11 @@
 # 阶段 0 · 度量与归因 设计文档
 
-版本 v1.0 · 2026-10-30
-所属：上下文治理方案 阶段 0（前置阶段，其余四个阶段都以本阶段的输出为输入）
+版本 v1.1 · 2026-11-02（v1.0 · 2026-10-30）
+所属：上下文治理方案 阶段 0（前置阶段，其余阶段都以本阶段的输出为输入）
 依赖：无
-被谁依赖：阶段 1（读取纪律）、阶段 2（确定性裁剪）、阶段 3（状态外部化）、阶段 4（子 agent 隔离）
+被谁依赖：2A（无损削减）、阶段 3（状态外部化）、2B（遮蔽）、阶段 1（读取纪律）、阶段 4（子 agent 隔离）
 
-> **本文的价格倍率与模拟公式已被 [ADR-0001](adr-0001-quality-first-defaults.md) 修订**（2026-11-02）：§3.1 的缓存倍率需按 provider 参数化（OpenAI / DeepSeek 无写入溢价），§4 的 SimEvent 示例数值算错（正确为 `Δ=1533`、`n*=1.24`），`S` 的定义需排除本轮新增 token。冲突处以 ADR 为准。
+运行前提：pi 跑在 **OpenAI 与 DeepSeek** 上——自动前缀缓存、**无写入溢价**。§3.2 的倍率表按此填写，§6.5 的模拟公式随之参数化。
 
 ---
 
@@ -134,6 +134,16 @@ input_tokens, cache_read_input_tokens, cache_creation_input_tokens, output_token
 - `cache_read_ratio = cache_read / (cache_read + cache_creation + uncached_input)`
 - 若 provider 不提供 → 该列输出 `n/a`，不猜
 
+**价格倍率必须按 provider 显式配置，不能写死在公式里。** 这是 v1.0 的一处错误：把 Anthropic 的显式缓存计费当成了通用物理。
+
+| provider | `c` 命中价 | `w` 重算价 | 缓存方式 | 粒度 / TTL（需实测） |
+|---|---|---|---|---|
+| **OpenAI** | **0.5** | **1.0** | 自动前缀 | 1024 token / 5–10 min |
+| **DeepSeek** | **0.1** | **1.0** | 自动前缀 | 64 token / 小时级 |
+| （Anthropic，本文不适用） | 0.1 | 1.25 | 显式 `cache_control` | 按块 / 5 min–1 h |
+
+`w = 1.0` 的含义是：改写位置之后的内容**按未命中价重算，没有额外溢价**。两家与 Anthropic 的结构性差异就在这里，它直接改变 §6.5 与 §13 的结论方向。
+
 ---
 
 ## 4. 数据结构
@@ -175,8 +185,9 @@ input_tokens, cache_read_input_tokens, cache_creation_input_tokens, output_token
 // SimEvent：遮蔽模拟的单次事件
 {
   "atTurn": 9, "entryId": "...", "tool": "read",
-  "M": 12480, "m": 164, "S": 2240,
-  "delta": 1893, "paybackTurns": 1.6,
+  "provider": "deepseek",
+  "M": 12480, "m": 160, "S": 2240,
+  "delta": 928, "paybackTurns": 0.75,
   "wouldMask": true, "skipReason": null
 }
 ```
@@ -199,7 +210,7 @@ input_tokens, cache_read_input_tokens, cache_creation_input_tokens, output_token
 | `repeat_error_count` | 归一化错误文本重复出现的次数 | 见 §6.4 |
 | `mask_sim.savings` | 模拟开启遮蔽后累计省下的 token | 逐轮递推，非静态估算 |
 | `mask_sim.payback` | 每条事件的 `n*` 分布（中位数 / P90） | |
-| `mask_sim.s_hist` | `S` 的分档直方图 | **这是决定成败的参数** |
+| `mask_sim.s_hist` | `S` 的分档直方图（`S` 只计上一轮已进入缓存的 token，不含本轮新增） | **这是决定成败的参数** |
 
 ---
 
@@ -276,20 +287,23 @@ for t in turns:
         if !lagSatisfied(msg, t): continue          # I1
         if !concluded(msg): continue                # I4（阶段 0 可先按"下一轮即视为收尾"近似）
         M = tokens(msg); m = estimateMaskTokens(msg)
-        S = tokensOfEverythingAfter(msg, context(t))
+        S = cachedTokensAfter(msg, context(t))   # 只算上一轮已进入缓存的部分，不含本轮新增
         if M < max(minTokens, ratio * S): continue
-        Δ = 1.15*S + 1.25*m - 0.1*M
-        n = max(0, Δ) / (0.1*(M - m))
+        Δ = w*m + (w - c)*S - c*M                # c/w 取自 §3.2 的 provider 表
+        n = max(0, Δ) / (c*(M - m))
+        paybackOk = c*(M - m)*(R - t) > w*m + (w - c)*S   # 会话级判据，R 见 §6.2
         emit SimEvent(...)
         maskedIds.add(msg.id)
     # 2) 计算本轮 effective（被遮蔽的用 m 替代）
     effective[t] = sum(m if id in maskedIds else tokens(...))
 ```
 
-两个必须一起输出的东西：
+三个必须一起输出的东西：
 
 1. **收益曲线**：`effective_original[t]` vs `effective_masked[t]`，以及累计省下的 token
 2. **敏感性分析**：把"假设在 t-5 / t-10 轮前遮蔽"的 `Δ` 也算一遍，直接展示 FIFO 违规的代价陡增（这是设计文档 §2.4 那张回本表的实测版）
+
+3. **判据占比**：按 §2.4 的会话级不等式逐条判定 `paybackOk`，输出"满足条件的条目 / 总候选条目"。**这是 2B 做不做的唯一依据**：≥ 50% 建议开启；低于 50% 延后，但不"预期不做"——原方案把这件事写成了定性预期，在 OpenAI 上方向是错的。
 
 **局限（必须写进报告）**：模拟假设"被遮蔽后模型行为不变"。真实的步数变化、重读行为只能靠阶段 4 的真跑。模拟只回答"账算不算得过来"，不回答"模型会不会变笨"。
 
@@ -398,7 +412,7 @@ input,cache_read,cache_write,output,overhead_est,compaction,masked_sim,sim_savin
 
 ## 13. 附录 A：为什么 `S` 是唯一要盯的参数
 
-阶段 2 的账全部落在 `Δ = 1.15·S + 1.25·m − 0.1·M`。三个变量里：
+阶段 2B 的账全部落在 `Δ = w·m + (w−c)·S − c·M`。在本项目的两家 provider 上 `w = 1.0`，于是简化为 `Δ = m + (1−c)·S − c·M`——OpenAI `m + 0.5S − 0.5M`，DeepSeek `m + 0.9S − 0.1M`。三个变量里：
 
 - `m` 由模板决定，可控且稳定（约 160）
 - `M` 由工具输出决定，不可控
@@ -414,3 +428,19 @@ input,cache_read,cache_write,output,overhead_est,compaction,masked_sim,sim_savin
 | 缓存命中率低 | "压缩破坏了缓存" | 多半是前缀里有每轮变化的内容（时间戳、状态块） |
 | 工具输出占比高 | "要压缩工具输出" | 先看分布：少数巨块 → 改读取粒度；长尾小块 → 才用遮蔽 |
 | 会话很长 | "一定撞窗口了" | 看 `effective_peak / window`；很多长会话其实只用了一半 |
+
+---
+
+## 15. 修订记录
+
+**v1.1 · 2026-11-02**
+
+| 改动 | 原内容 | 原因 |
+|---|---|---|
+| 缓存倍率按 provider 参数化（§3.2） | 假定 `w=1.25, c=0.1` | 项目跑 OpenAI（`c=0.5`）与 DeepSeek（`c=0.1`），两家都**没有写入溢价**（`w=1.0`） |
+| 模拟公式参数化（§6.5、§13） | `Δ = 1.15·S + 1.25·m − 0.1·M` | 只是 Anthropic 特例，不能当通用式 |
+| `S` 的定义收紧（§5、§6.5） | "改动点之后的内容" | 必须排除本轮新增 token，否则模拟系统性高估 `S`——附录 §12 那句"若 S 中位数远超 5k 说明实现有问题"，很可能就是这个口径错误本身 |
+| SimEvent 示例数值（§4） | `delta=1893, paybackTurns=1.6` | 与公式不符。按 DeepSeek 口径应为 `928` 与 `0.75` |
+| 新增第三个输出（§6.5） | 只输出收益曲线与敏感性 | 增加"判据占比"，它是 2B 决策的唯一输入 |
+
+指标口径、五维归因、缓存抖动检测、重复错误检测**均未改动**。
